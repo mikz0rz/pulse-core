@@ -16,7 +16,7 @@ private if it contains real keys, list IDs, or competitor URLs.
 Copy [`examples/deploy-template/`](./examples/deploy-template) into a new repo.
 It's a complete, runnable starter:
 
-- point the `pulse-core` dependency at your GitHub fork/copy (`github:<you>/pulse-core#main`)
+- point the `pulse-core` dependency at your GitHub fork/copy (`github:mikz0rz/pulse-core#main`)
 - `cp .env.example .env` and fill in secrets
 - edit `sources.json` for what you want to track
 - `npm install && npm run build && npm start`
@@ -114,7 +114,7 @@ docker compose up --build -d
 Notes:
 - The Docker image resolves `pulse-core` from GitHub at install time, so the
   core must be pushed (public or private-with-access) and the dependency must
-  point at `github:<you>/pulse-core#<ref>` — not a local `file:` path.
+  point at `github:mikz0rz/pulse-core#<ref>` — not a local `file:` path.
 - Put Caddy or Nginx in front for automatic HTTPS; the login password is sent
   over the connection.
 - Set `NODE_ENV=production` so the session cookie gets its `Secure` flag.
@@ -134,7 +134,7 @@ git tag v0.2.0 && git push --tags
 
 ```jsonc
 // in your deploy repo's package.json
-"pulse-core": "github:<you>/pulse-core#v0.2.0"
+"pulse-core": "github:mikz0rz/pulse-core#v0.2.0"
 ```
 
 `git pull` + rebuild pulls core changes into every deployment automatically when

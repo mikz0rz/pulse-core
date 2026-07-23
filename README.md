@@ -17,7 +17,7 @@ It's designed to be composed, not forked: **bring your own API keys and config**
 // package.json — reference the engine straight from GitHub
 {
   "dependencies": {
-    "pulse-core": "github:<your-gh-user>/pulse-core#main"
+    "pulse-core": "github:mikz0rz/pulse-core#main"
   }
 }
 ```

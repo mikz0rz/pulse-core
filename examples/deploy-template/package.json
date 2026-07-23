@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "dotenv": "^17.2.3",
-    "pulse-core": "github:YOUR_GH_USER/pulse-core#main"
+    "pulse-core": "github:mikz0rz/pulse-core#main"
   },
   "devDependencies": {
     "@types/node": "^25.0.10",
