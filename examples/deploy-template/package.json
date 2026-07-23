@@ -1,0 +1,19 @@
+{
+  "name": "my-terminal-deploy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A deployment of the pulse-core news terminal. Copy this template, fill in .env, and run.",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "pulse-core": "github:YOUR_GH_USER/pulse-core#main"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.10",
+    "typescript": "^5.9.3"
+  }
+}

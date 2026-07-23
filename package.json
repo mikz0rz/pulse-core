@@ -1,0 +1,57 @@
+{
+  "name": "pulse-core",
+  "version": "0.1.0",
+  "description": "A composable news-terminal engine: fetch, summarize, dedupe and serve a live feed from Twitter/X lists, RSS feeds, curated aggregators and website-change tracking. Bring your own keys.",
+  "type": "module",
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/index.d.ts",
+      "import": "./build/index.js"
+    }
+  },
+  "bin": {
+    "pulse-mcp": "./build/mcp.js"
+  },
+  "files": [
+    "build",
+    "frontend/dist"
+  ],
+  "scripts": {
+    "build": "tsc && npm --prefix frontend run build",
+    "prepare": "npm --prefix frontend install && npm run build",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "news",
+    "rss",
+    "twitter",
+    "feed",
+    "terminal",
+    "llm",
+    "summarization"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.3",
+    "better-sqlite3": "^13.0.1",
+    "cheerio": "^1.2.0",
+    "diff": "^9.0.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "puppeteer": "^24.36.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "rss-parser": "^3.13.0",
+    "undici": "^7.19.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/diff": "^7.0.2",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.0.10",
+    "typescript": "^5.9.3"
+  }
+}

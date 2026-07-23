@@ -1,0 +1,276 @@
+import { EventEmitter } from "events";
+import { randomUUID } from "crypto";
+import type { TwitterClient } from "./twitter-client.js";
+import { browserMutex } from "./browser-mutex.js";
+import { buildTweetDump, generateFeedItems, generateDigest, generateSections } from "./summarizer.js";
+import {
+  filterNewTweets,
+  insertRawTweets,
+  insertFeedItems,
+  markFetchRunning,
+  markFetchDone,
+  getRecentFeedItemsByTimestamp,
+  getTopCategories,
+  normalizeCategory,
+  upsertDigest,
+  upsertSection,
+  getCheckpoint,
+  type ResolvedFeedItem,
+} from "./db.js";
+import type { TwitterListSourceConfig, Source, Tweet, ExtraSection } from "./types.js";
+import type { FeatureFlags } from "./terminal-config.js";
+
+export const schedulerEvents = new EventEmitter();
+
+const AUTH_FAILURE_THRESHOLD = 3;
+const consecutiveFailures = new Map<string, number>();
+const DIGEST_WINDOW_HOURS = 24;
+
+// A source is never left staler than this: the background loop runs at least
+// this often regardless of a source's configured (possibly larger) interval.
+export const MAX_REFRESH_INTERVAL_MINUTES = 24 * 60;
+
+// The floor between *user/on-open-triggered* refreshes of the same source, so
+// opening the app or mashing "Refresh now" can't hammer a source (or the
+// scraped account). The background scheduler is not subject to this.
+export const MIN_MANUAL_REFRESH_MS = 15 * 60 * 1000;
+
+export interface RefreshEligibility {
+  allowed: boolean;
+  reason?: "running" | "recent";
+  retryAfterMs?: number;
+  nextAllowedAt?: string;
+}
+
+/**
+ * Whether a user-triggered (manual button or on-open) refresh of this source
+ * should be honored right now. Blocked while a cycle is already running, or if
+ * one completed under MIN_MANUAL_REFRESH_MS ago. The background scheduler
+ * bypasses this entirely.
+ */
+export function getRefreshEligibility(listId: string): RefreshEligibility {
+  const cp = getCheckpoint(listId);
+  if (cp?.lastFetchStatus === "running") {
+    return { allowed: false, reason: "running" };
+  }
+  const last = cp?.lastFetchCompletedAt ? Date.parse(cp.lastFetchCompletedAt) : 0;
+  if (last) {
+    const elapsed = Date.now() - last;
+    if (elapsed < MIN_MANUAL_REFRESH_MS) {
+      return {
+        allowed: false,
+        reason: "recent",
+        retryAfterMs: MIN_MANUAL_REFRESH_MS - elapsed,
+        nextAllowedAt: new Date(last + MIN_MANUAL_REFRESH_MS).toISOString(),
+      };
+    }
+  }
+  return { allowed: true };
+}
+
+// Injected once by startTerminal — gates the optional synthesis features.
+let features: FeatureFlags = { websiteDiff: true, extraSections: true, aiDigest: true };
+
+export function configureScheduler(flags: FeatureFlags): void {
+  features = flags;
+}
+
+/**
+ * Regenerates a list's rolling digest from its trailing 24h of stories.
+ * Shared by the Twitter-list pipeline (runListCycle below) and any other
+ * source (e.g. huggingnews.ts) that persists items into the same feed_items
+ * table under its own list id. Only called when a cycle actually produced
+ * new items, mirroring the "skip the LLM call when nothing changed" cost
+ * control used for the main feed-item generation. Failures here are logged,
+ * not thrown — the feed items themselves are already safely persisted by the
+ * time this runs, so a digest hiccup shouldn't turn a successful cycle into
+ * a reported error.
+ */
+export async function refreshDigest(listId: string, description: string): Promise<void> {
+  if (!features.aiDigest) return;
+  try {
+    const sinceIso = new Date(Date.now() - DIGEST_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
+    const recentItems = getRecentFeedItemsByTimestamp(listId, sinceIso);
+    if (recentItems.length === 0) return;
+
+    const bullets = await generateDigest(recentItems, { description });
+    if (bullets.length > 0) upsertDigest(listId, bullets, recentItems.length);
+  } catch (error) {
+    console.warn(`[scheduler] Digest generation failed for ${listId}:`, error);
+  }
+}
+
+/**
+ * Regenerates a list's configured extraSections from its trailing 24h of
+ * stories, replacing each section's stored row rather than accumulating a
+ * new one every cycle (mirrors refreshDigest exactly). Only called when
+ * TwitterListSourceConfig.showExtraSections is truthy — this is an opt-in
+ * feature, off by default, so it's never force-shown to anyone viewing a
+ * list that merely has extraSections defined.
+ */
+async function refreshSections(listId: string, description: string, sections: ExtraSection[]): Promise<void> {
+  try {
+    const sinceIso = new Date(Date.now() - DIGEST_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
+    const recentItems = getRecentFeedItemsByTimestamp(listId, sinceIso);
+    if (recentItems.length === 0) return;
+
+    const generated = await generateSections(recentItems, { description }, sections);
+    for (const section of generated) {
+      upsertSection(listId, section.title, section.content);
+    }
+  } catch (error) {
+    console.warn(`[scheduler] Section synthesis failed for ${listId}:`, error);
+  }
+}
+
+/**
+ * Generic cycle runner for "simple" sources — ones needing no LLM step and no
+ * shared-browser-mutex serialization (HuggingNews today; a future RSS feed
+ * would likely fit this too): mark running -> fetch already-deduped new
+ * items -> insert -> refresh digest -> mark done -> emit, or mark error on
+ * failure. Twitter lists keep their own runListCycle below instead, since
+ * browser-mutex scraping, raw-tweet dedup, LLM summarization, and
+ * auth-failure classification don't fit this generic shape.
+ */
+export async function runSimpleSourceCycle(
+  id: string,
+  description: string,
+  fetchNewItems: () => Promise<ResolvedFeedItem[]>
+): Promise<void> {
+  console.log(`[scheduler] Running cycle for ${id}...`);
+  markFetchRunning(id);
+
+  try {
+    const items = await fetchNewItems();
+    console.log(`[scheduler] ${id}: ${items.length} new item(s).`);
+
+    if (items.length === 0) {
+      markFetchDone(id, "ok");
+      return;
+    }
+
+    const batchId = randomUUID();
+    insertFeedItems(id, batchId, items);
+    await refreshDigest(id, description);
+
+    markFetchDone(id, "ok");
+    schedulerEvents.emit("feed-item", { listId: id, batchId, count: items.length });
+  } catch (error: any) {
+    console.error(`[scheduler] Error processing ${id}:`, error);
+    markFetchDone(id, "error", String(error?.message ?? error));
+  }
+}
+
+/**
+ * Fetches, dedupes, and summarizes one list's new tweets, then persists the
+ * result. Shared by the background scheduler loop and the manual-refresh API
+ * route so both go through the same browser mutex and can't race each other.
+ */
+export async function runListCycle(twitter: TwitterClient, config: TwitterListSourceConfig): Promise<void> {
+  console.log(`[scheduler] Running cycle for list ${config.id}...`);
+  markFetchRunning(config.id);
+
+  try {
+    const hoursWindow = config.hoursWindow ?? 24;
+    const tweets = await browserMutex.run(() => twitter.getListTweets(config.twitterListId, 50, hoursWindow));
+
+    const newTweets = filterNewTweets(tweets);
+    console.log(`[scheduler] List ${config.id}: fetched ${tweets.length}, ${newTweets.length} new.`);
+
+    if (newTweets.length === 0) {
+      markFetchDone(config.id, "ok");
+      consecutiveFailures.set(config.id, 0);
+      return;
+    }
+
+    insertRawTweets(config.id, newTweets);
+
+    const { dumpText, refMap } = buildTweetDump(newTweets);
+    const existingCategories = getTopCategories(config.id);
+    const drafts = await generateFeedItems(dumpText, config, existingCategories);
+
+    const resolved: ResolvedFeedItem[] = drafts.map((draft) => {
+      const sourceTweets = (draft.sourceRefs ?? [])
+        .map((ref) => refMap.get(ref))
+        .filter((t): t is Tweet => Boolean(t));
+
+      const sourceTweetIds = sourceTweets.map((t) => t.id);
+      const sourceUrls = sourceTweets
+        .filter((t) => t.author.username)
+        .map((t) => `https://x.com/${t.author.username}/status/${t.id}`);
+
+      const itemTimestamp =
+        sourceTweets.length > 0
+          ? new Date(Math.max(...sourceTweets.map((t) => new Date(t.created_at).getTime()))).toISOString()
+          : new Date().toISOString();
+
+      return {
+        ...draft,
+        category: normalizeCategory(draft.category, existingCategories),
+        sourceTweetIds,
+        sourceUrls,
+        itemTimestamp,
+      };
+    });
+
+    const batchId = randomUUID();
+    insertFeedItems(config.id, batchId, resolved);
+    await refreshDigest(config.id, config.description);
+    if (features.extraSections && config.showExtraSections && config.extraSections?.length) {
+      await refreshSections(config.id, config.description, config.extraSections);
+    }
+
+    markFetchDone(config.id, "ok");
+    consecutiveFailures.set(config.id, 0);
+
+    schedulerEvents.emit("feed-item", { listId: config.id, batchId, count: resolved.length });
+  } catch (error: any) {
+    const failures = (consecutiveFailures.get(config.id) ?? 0) + 1;
+    consecutiveFailures.set(config.id, failures);
+
+    const looksLikeAuthFailure = /login|auth/i.test(String(error?.message ?? ""));
+    const status = failures >= AUTH_FAILURE_THRESHOLD || looksLikeAuthFailure ? "auth_expired" : "error";
+
+    console.error(`[scheduler] Error processing list ${config.id}:`, error);
+    markFetchDone(config.id, status, String(error?.message ?? error));
+  }
+}
+
+/** Wraps a Twitter list config into a Source for the generic scheduler/server to orchestrate. */
+export function createTwitterListSource(twitter: TwitterClient, config: TwitterListSourceConfig): Source {
+  return {
+    id: config.id,
+    type: "twitter_list",
+    description: config.description,
+    refreshIntervalMinutes: config.refreshIntervalMinutes ?? 30,
+    runCycle: () => runListCycle(twitter, config),
+  };
+}
+
+/**
+ * Starts one independent recursive-timeout loop per source. Uses setTimeout
+ * (not setInterval) so the next run is only scheduled once the current one
+ * fully completes — Twitter scrapes can take 45-60s+, so setInterval would
+ * let cycles pile up in the browser mutex queue. Source-agnostic: works the
+ * same for Twitter lists, HuggingNews, or any future source type, since all
+ * that's needed is `refreshIntervalMinutes` and `runCycle()`.
+ */
+export function startScheduler(sources: Source[]): void {
+  sources.forEach((source, index) => {
+    // Clamp to the max-staleness guarantee: even a source configured with a
+    // huge (or missing) interval still refreshes at least once every 24h.
+    const effectiveMinutes = Math.min(source.refreshIntervalMinutes, MAX_REFRESH_INTERVAL_MINUTES);
+    const intervalMs = effectiveMinutes * 60 * 1000;
+
+    const scheduleNext = () => {
+      setTimeout(() => {
+        source.runCycle().then(scheduleNext);
+      }, intervalMs);
+    };
+
+    // Stagger initial kick-off so sources don't all hit the browser mutex at once.
+    setTimeout(() => {
+      source.runCycle().then(scheduleNext);
+    }, index * 5000);
+  });
+}

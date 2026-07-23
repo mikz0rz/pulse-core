@@ -1,0 +1,37 @@
+[
+  {
+    "type": "rss_feed",
+    "id": "example-blog",
+    "description": "Example Blog",
+    "feedUrl": "https://stackoverflow.blog/feed/",
+    "refreshIntervalMinutes": 60,
+    "enabled": true
+  },
+  {
+    "type": "media_list",
+    "id": "huggingnews",
+    "provider": "huggingnews",
+    "description": "HuggingNews",
+    "refreshIntervalMinutes": 20,
+    "enabled": false
+  },
+  {
+    "type": "twitter_list",
+    "id": "my-list",
+    "twitterListId": "YOUR_LIST_ID",
+    "description": "My Twitter List",
+    "promptContext": "Focus on product launches and company news.",
+    "hoursWindow": 24,
+    "refreshIntervalMinutes": 30,
+    "enabled": false
+  },
+  {
+    "type": "website_diff",
+    "id": "a-page-to-watch",
+    "description": "A Page To Watch",
+    "url": "https://example.com/pricing",
+    "selector": "main",
+    "refreshIntervalMinutes": 180,
+    "enabled": false
+  }
+]
