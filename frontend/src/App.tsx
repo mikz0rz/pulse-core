@@ -19,12 +19,36 @@ const FEED_LIMIT = 100;
 // (returns 429); this is only for pre-emptively disabling the button + tooltip.
 const MIN_REFRESH_MS = 15 * 60 * 1000;
 
-const SOURCE_TYPE_LABELS: Record<SourceType, string> = {
-  twitter_list: "X List",
-  media_list: "Media List",
-  rss_feed: "RSS Feed",
-  website_diff: "Website Diff",
+// Tab groups, in display order. X lists lead so they sit at the top and the
+// first of them is preselected on load; everything else follows by type.
+const SOURCE_GROUP_ORDER: SourceType[] = ["twitter_list", "media_list", "rss_feed", "website_diff"];
+
+const SOURCE_GROUP_LABELS: Record<SourceType, string> = {
+  twitter_list: "X Lists",
+  media_list: "News",
+  rss_feed: "RSS Feeds",
+  website_diff: "Website Watch",
 };
+
+interface ListGroup {
+  type: SourceType;
+  label: string;
+  lists: ListSummary[];
+}
+
+/** Bucket lists by source type in SOURCE_GROUP_ORDER, dropping empty groups. */
+function groupListsByType(lists: ListSummary[]): ListGroup[] {
+  return SOURCE_GROUP_ORDER.map((type) => ({
+    type,
+    label: SOURCE_GROUP_LABELS[type],
+    lists: lists.filter((l) => l.type === type),
+  })).filter((g) => g.lists.length > 0);
+}
+
+/** The tab that should be selected by default: the first one in display order (an X list when present). */
+function defaultSelectedId(lists: ListSummary[]): string | null {
+  return groupListsByType(lists)[0]?.lists[0]?.id ?? null;
+}
 
 /** Milliseconds until this source may be manually refreshed again (0 if now). */
 function refreshBackoffMsLeft(cp: ListCheckpoint | null | undefined): number {
@@ -90,7 +114,7 @@ function Feed({ title }: { title: string }) {
   const refreshLists = useCallback(async () => {
     const data = await getLists();
     setLists(data);
-    setSelected((prev) => prev ?? data[0]?.id ?? null);
+    setSelected((prev) => prev ?? defaultSelectedId(data));
   }, []);
 
   const loadFeed = useCallback(async (listId: string, highlightNew: boolean) => {
@@ -201,6 +225,7 @@ function Feed({ title }: { title: string }) {
     : selectedBackoffMs > 0
       ? `You can refresh again in ${minutesLeftLabel(selectedBackoffMs)}`
       : "Fetch the latest now";
+  const listGroups = useMemo(() => groupListsByType(lists), [lists]);
   const storyItems = items;
   const categories = useMemo(() => deriveCategoryCounts(storyItems), [storyItems]);
   const filteredStories = useMemo(
@@ -228,18 +253,22 @@ function Feed({ title }: { title: string }) {
       <SyncStatusBar lists={lists} />
 
       <nav className="list-tabs">
-        {lists.map((l) => (
-          <button
-            key={l.id}
-            className={`list-tab ${l.id === selected ? "list-tab--active" : ""}`}
-            onClick={() => setSelected(l.id)}
-          >
-            <span className={`status-dot status-dot--${l.checkpoint?.lastFetchStatus ?? "unknown"}`} />
-            <span className="list-tab__text">
-              {l.description}
-              <span className="list-tab__type">{SOURCE_TYPE_LABELS[l.type]}</span>
-            </span>
-          </button>
+        {listGroups.map((group) => (
+          <div key={group.type} className="list-group">
+            <h2 className="list-group__title">{group.label}</h2>
+            <div className="list-group__tabs">
+              {group.lists.map((l) => (
+                <button
+                  key={l.id}
+                  className={`list-tab ${l.id === selected ? "list-tab--active" : ""}`}
+                  onClick={() => setSelected(l.id)}
+                >
+                  <span className={`status-dot status-dot--${l.checkpoint?.lastFetchStatus ?? "unknown"}`} />
+                  <span className="list-tab__text">{l.description}</span>
+                </button>
+              ))}
+            </div>
+          </div>
         ))}
       </nav>
 
