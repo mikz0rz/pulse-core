@@ -8,7 +8,10 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+# NOTE: do NOT ignore `dist` here. pulse-core is consumed as a git dependency,
+# and this nested .gitignore would exclude the built UI (frontend/dist) from
+# what npm packs, even though it's in package.json "files". The built UI is
+# still kept out of commits by the root .gitignore's `frontend/dist/`.
 dist-ssr
 *.local
 
