@@ -76,7 +76,7 @@ Single-user password login → HMAC-signed, self-verifying session cookie (**no 
 
 ### Frontend (`frontend/`)
 
-React 19 + Vite + TypeScript, its **own `package.json`/`node_modules`** separate from the backend. Built to `frontend/dist/`, which the backend Express process serves statically in production (resolved relative to the compiled module, not cwd, so it works when installed as a dependency). Live updates come via SSE on `/api/events` (`feed-item` events trigger a refetch). There is no separate frontend host.
+React 19 + Vite + TypeScript, its **own `package.json`/`node_modules`** separate from the backend. Built to `frontend/dist/`, which the backend Express process serves statically in production (resolved relative to the compiled module, not cwd, so it works when installed as a dependency). Live updates come via SSE on `/api/events`: every list state transition (cycle start/finish/failure) emits a `list-updated` event, which always refetches the tab summaries and reloads the open feed only when that list gained new items (`count > 0`). There is no separate frontend host.
 
 ### MCP server (`src/mcp.ts`)
 

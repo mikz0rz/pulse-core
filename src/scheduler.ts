@@ -17,10 +17,23 @@ import {
   getCheckpoint,
   type ResolvedFeedItem,
 } from "./db.js";
-import type { TwitterListSourceConfig, Source, Tweet, ExtraSection } from "./types.js";
+import type { TwitterListSourceConfig, Source, Tweet, ExtraSection, ListFetchStatus } from "./types.js";
 import type { FeatureFlags } from "./terminal-config.js";
 
 export const schedulerEvents = new EventEmitter();
+
+/**
+ * Pushes a list's state change to any connected client via the `list-updated`
+ * SSE event (relayed in terminal.ts). Emitted on EVERY meaningful checkpoint
+ * transition — cycle start ("running"), completion ("ok", with or without new
+ * items), and failure ("error"/"auth_expired") — so the UI's tab status dots,
+ * status bar, and "Refresh now" enablement track live state without a manual
+ * reload. `count` is the number of newly-inserted items (0 when none); the
+ * frontend only reloads the open feed's stories when count > 0.
+ */
+function emitListUpdate(listId: string, status: ListFetchStatus, count = 0): void {
+  schedulerEvents.emit("list-updated", { listId, status, count });
+}
 
 const AUTH_FAILURE_THRESHOLD = 3;
 const consecutiveFailures = new Map<string, number>();
@@ -139,6 +152,7 @@ export async function runSimpleSourceCycle(
 ): Promise<void> {
   console.log(`[scheduler] Running cycle for ${id}...`);
   markFetchRunning(id);
+  emitListUpdate(id, "running");
 
   try {
     const items = await fetchNewItems();
@@ -146,6 +160,7 @@ export async function runSimpleSourceCycle(
 
     if (items.length === 0) {
       markFetchDone(id, "ok");
+      emitListUpdate(id, "ok", 0);
       return;
     }
 
@@ -154,10 +169,11 @@ export async function runSimpleSourceCycle(
     await refreshDigest(id, description);
 
     markFetchDone(id, "ok");
-    schedulerEvents.emit("feed-item", { listId: id, batchId, count: items.length });
+    emitListUpdate(id, "ok", items.length);
   } catch (error: any) {
     console.error(`[scheduler] Error processing ${id}:`, error);
     markFetchDone(id, "error", String(error?.message ?? error));
+    emitListUpdate(id, "error", 0);
   }
 }
 
@@ -169,6 +185,7 @@ export async function runSimpleSourceCycle(
 export async function runListCycle(twitter: TwitterClient, config: TwitterListSourceConfig): Promise<void> {
   console.log(`[scheduler] Running cycle for list ${config.id}...`);
   markFetchRunning(config.id);
+  emitListUpdate(config.id, "running");
 
   try {
     const hoursWindow = config.hoursWindow ?? 24;
@@ -180,6 +197,7 @@ export async function runListCycle(twitter: TwitterClient, config: TwitterListSo
     if (newTweets.length === 0) {
       markFetchDone(config.id, "ok");
       consecutiveFailures.set(config.id, 0);
+      emitListUpdate(config.id, "ok", 0);
       return;
     }
 
@@ -223,7 +241,7 @@ export async function runListCycle(twitter: TwitterClient, config: TwitterListSo
     markFetchDone(config.id, "ok");
     consecutiveFailures.set(config.id, 0);
 
-    schedulerEvents.emit("feed-item", { listId: config.id, batchId, count: resolved.length });
+    emitListUpdate(config.id, "ok", resolved.length);
   } catch (error: any) {
     const failures = (consecutiveFailures.get(config.id) ?? 0) + 1;
     consecutiveFailures.set(config.id, failures);
@@ -233,6 +251,7 @@ export async function runListCycle(twitter: TwitterClient, config: TwitterListSo
 
     console.error(`[scheduler] Error processing list ${config.id}:`, error);
     markFetchDone(config.id, status, String(error?.message ?? error));
+    emitListUpdate(config.id, status, 0);
   }
 }
 

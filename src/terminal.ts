@@ -137,16 +137,16 @@ export function startTerminal(options: StartTerminalOptions): void {
     });
     res.write("retry: 3000\n\n");
 
-    const onFeedItem = (payload: unknown) => {
-      res.write(`event: feed-item\ndata: ${JSON.stringify(payload)}\n\n`);
+    const onListUpdate = (payload: unknown) => {
+      res.write(`event: list-updated\ndata: ${JSON.stringify(payload)}\n\n`);
     };
-    schedulerEvents.on("feed-item", onFeedItem);
+    schedulerEvents.on("list-updated", onListUpdate);
 
     const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 20000);
 
     req.on("close", () => {
       clearInterval(heartbeat);
-      schedulerEvents.off("feed-item", onFeedItem);
+      schedulerEvents.off("list-updated", onListUpdate);
     });
   });
 

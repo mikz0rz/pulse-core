@@ -97,6 +97,13 @@ function Feed({ title }: { title: string }) {
   const [readIds, setReadIds] = useState<Set<number>>(() => loadReadIds());
   const [, setTick] = useState(0);
   const autoRefreshedRef = useRef(false);
+  // Mirrors `selected` for the long-lived SSE listener, so it can read the
+  // current tab without the effect re-subscribing (and dropping events) on
+  // every tab switch.
+  const selectedRef = useRef(selected);
+  useEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
 
   // Read/seen state is per-browser (localStorage), single-user app — no server.
   const setRead = useCallback((ids: number[], read: boolean) => {
@@ -171,19 +178,25 @@ function Feed({ title }: { title: string }) {
     }
   }, [selected, loadFeed, loadDigest, loadSections]);
 
+  // One persistent SSE connection for the app's lifetime. Every list state
+  // change (a cycle starting/finishing/failing, in the background or triggered
+  // by anyone) pushes a `list-updated` event: always refresh the tab summaries
+  // so status dots, the status bar, and the refresh button track live; reload
+  // the open feed's stories only when that list actually gained new items.
   useEffect(() => {
     const source = new EventSource("/api/events");
-    source.addEventListener("feed-item", (e) => {
-      const payload = JSON.parse((e as MessageEvent).data) as { listId: string };
+    source.addEventListener("list-updated", (e) => {
+      const payload = JSON.parse((e as MessageEvent).data) as { listId: string; count?: number };
       refreshLists();
-      if (payload.listId === selected) {
-        loadFeed(selected, true);
-        loadDigest(selected);
-        loadSections(selected);
+      const current = selectedRef.current;
+      if (payload.listId === current && (payload.count ?? 0) > 0) {
+        loadFeed(current, true);
+        loadDigest(current);
+        loadSections(current);
       }
     });
     return () => source.close();
-  }, [selected, loadFeed, loadDigest, loadSections, refreshLists]);
+  }, [loadFeed, loadDigest, loadSections, refreshLists]);
 
   useEffect(() => {
     if (newIds.size === 0) return;
@@ -297,9 +310,10 @@ function Feed({ title }: { title: string }) {
           >
             Mark all read
           </button>
-          {/* Wrapper carries the tooltip: a disabled <button> doesn't fire hover events. */}
-          <span className="refresh-wrap" title={refreshTooltip}>
-            <button onClick={handleRefresh} disabled={refreshDisabled}>
+          {/* Wrapper carries the tooltip: a disabled <button> doesn't fire hover
+              events, and data-tooltip (vs. native title) shows it instantly. */}
+          <span className="refresh-wrap" data-tooltip={refreshTooltip}>
+            <button onClick={handleRefresh} disabled={refreshDisabled} aria-label={refreshTooltip}>
               {refreshing ? "Refreshing…" : "Refresh now"}
             </button>
           </span>
