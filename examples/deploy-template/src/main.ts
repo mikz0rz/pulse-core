@@ -31,6 +31,12 @@ startTerminal({
 
   sources,
 
+  // Optional (default 12): hours a source may go without producing a single
+  // item before the UI raises it as a stale-source alert. Catches the silent
+  // failure where fetches keep succeeding but return nothing. Override per
+  // source with `stalenessThresholdHours` in sources.json (0 to silence one).
+  // stalenessThresholdHours: 12,
+
   // Turn capabilities on/off for this deployment.
   features: {
     websiteDiff: true,

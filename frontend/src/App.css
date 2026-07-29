@@ -239,6 +239,14 @@
   box-shadow: var(--glow-danger);
 }
 
+/* Refreshing fine but producing nothing (see staleness.ts) — a distinct state
+   from both healthy and outright failing, so it gets its own hollow dot. */
+.status-dot--stale {
+  background: transparent;
+  border: 2px solid var(--danger);
+  box-shadow: var(--glow-danger);
+}
+
 .status-dot--running::before {
   content: "";
   position: absolute;
@@ -359,6 +367,10 @@
   opacity: 0.6;
   cursor: default;
   box-shadow: none;
+}
+
+.feed-toolbar__status--stale {
+  color: var(--danger);
 }
 
 .feed-toolbar__backoff {
@@ -815,6 +827,130 @@
   color: var(--accent);
   font-size: 11px;
   box-shadow: var(--glow-accent);
+}
+
+/* ── Alert snacks ─────────────────────────────────────────────────── */
+
+.snacks {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  width: min(400px, calc(100vw - 32px));
+}
+
+.snack {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  animation: snack-in 0.22s ease-out;
+}
+
+.snack--error {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+/* Colored edge rather than a colored fill — the copy stays readable in both themes. */
+.snack--error::before,
+.snack--warn::before {
+  content: "";
+  align-self: stretch;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--danger);
+  flex-shrink: 0;
+}
+
+.snack--warn::before {
+  background: #f5a623;
+}
+
+.snack__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.snack__title {
+  color: var(--text-h);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.snack__detail {
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.snack__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.snack__action {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  color: var(--text-h);
+  border-radius: 6px;
+  padding: 4px 9px;
+  font-size: 12px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.snack__action:hover {
+  border-color: var(--accent-border);
+  box-shadow: var(--glow-accent);
+}
+
+.snack__dismiss {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 6px;
+}
+
+.snack__dismiss:hover {
+  color: var(--text-h);
+}
+
+.snacks__more {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+@keyframes snack-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .snack {
+    animation: none;
+  }
 }
 
 @media (max-width: 560px) {

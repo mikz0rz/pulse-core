@@ -1,5 +1,6 @@
 import { hasExternalFeedItem, type ResolvedFeedItem } from "./db.js";
 import { runSimpleSourceCycle } from "./scheduler.js";
+import { resolveStalenessThresholdHours } from "./staleness.js";
 import type { MediaListSourceConfig, Source } from "./types.js";
 
 // Public, source-linked AI news aggregator (https://huggingnews.com) — a
@@ -119,6 +120,7 @@ export function createMediaListSource(config: MediaListSourceConfig): Source {
     type: "media_list",
     description: config.description,
     refreshIntervalMinutes: config.refreshIntervalMinutes ?? 20,
+    stalenessThresholdHours: resolveStalenessThresholdHours(config),
     runCycle: () => runHuggingNewsCycle(config),
   };
 }

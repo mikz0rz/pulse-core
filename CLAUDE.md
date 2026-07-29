@@ -23,8 +23,8 @@ There is **no test framework and no tests** in this repo — don't hunt for a te
 
 - **ESM + `Node16` module resolution**: relative imports MUST carry a `.js` extension even when importing a `.ts` file (e.g. `import { startTerminal } from "./terminal.js"`). All new imports must follow this or `tsc` fails.
 - **The core reads NOTHING from `process.env`.** Every secret, key, cookie, and toggle is injected through the single `startTerminal(options)` call. The lone exception is `src/mcp.ts` (a standalone `pulse-mcp` bin) which reads env directly via `dotenv` — it is independent of `startTerminal`.
-- **Frontend types are hand-mirrored.** `frontend/src/api.ts` duplicates backend types (`FeedItem`, `SourceType`, `ListCheckpoint`, …) by hand — there is no shared types package. Change a wire-facing type on the backend and you must update `api.ts` too.
-- **Config-injection singletons.** Most backend modules hold a module-level config set once at boot: `initDb(dbPath)`, `configureSummarizer(llm, prompts)`, `configureAuth(...)`, `configureHuggingNews(key)`, `configureScheduler(features)`. `startTerminal` (`src/terminal.ts`) wires all of them before building sources. There is no DI container — reach for these functions to inject config in tests/tools.
+- **Frontend types are hand-mirrored.** `frontend/src/api.ts` duplicates backend types (`FeedItem`, `SourceType`, `ListCheckpoint`, …) by hand — there is no shared types package. Change a wire-facing type on the backend and you must update `api.ts` too. Same applies to the one piece of mirrored *logic*: `frontend/src/staleness.ts` reimplements `src/staleness.ts`'s verdict.
+- **Config-injection singletons.** Most backend modules hold a module-level config set once at boot: `initDb(dbPath)`, `configureSummarizer(llm, prompts)`, `configureAuth(...)`, `configureHuggingNews(key)`, `configureStaleness(hours)`, `configureScheduler(features)`. `startTerminal` (`src/terminal.ts`) wires all of them before building sources. There is no DI container — reach for these functions to inject config in tests/tools.
 
 ## Architecture
 
@@ -33,7 +33,7 @@ There is **no test framework and no tests** in this repo — don't hunt for a te
 Everything funnels through one interface in `src/types.ts`:
 
 ```ts
-interface Source { id; type; description; refreshIntervalMinutes; runCycle(): Promise<void> }
+interface Source { id; type; description; refreshIntervalMinutes; stalenessThresholdHours; runCycle(): Promise<void> }
 ```
 
 The scheduler, Express routes, and frontend orchestrate sources **uniformly by this interface** — they never special-case a source id. **Adding a new source category** (a 5th `SourceType`) is exactly three edits and nothing else:
@@ -43,6 +43,8 @@ The scheduler, Express routes, and frontend orchestrate sources **uniformly by t
 
 The four built-in types: `twitter_list` (scheduler.ts), `media_list`/HuggingNews (huggingnews.ts), `rss_feed` + `website_diff` (website-watch.ts).
 
+A `Source` also carries a resolved `stalenessThresholdHours` (see **Staleness** below), so a new category's factory must set it — `resolveStalenessThresholdHours(config)` does that from the config.
+
 ### Two cycle runners
 
 - `runSimpleSourceCycle(id, description, fetchNewItems)` in `src/scheduler.ts` — the generic path for sources that need no LLM step and no shared browser: mark-running → fetch already-deduped items → insert → refresh digest → mark-done → SSE-emit (or mark-error). HuggingNews, RSS, and website_diff all delegate to it.
@@ -51,6 +53,15 @@ The four built-in types: `twitter_list` (scheduler.ts), `media_list`/HuggingNews
 ### Data flow (all source types converge)
 
 Every source persists into the **one `feed_items` table** under its own `list_id`, so the same UI renders all types with no per-type code. Dedup differs by source: Twitter dedupes against the `raw_tweets` table; all other sources dedupe via an `external_id` UNIQUE index (`hasExternalFeedItem`). Optional per-source syntheses — the rolling TL;DR `digest` and the opt-in `extraSections` — are **regenerated in place each cycle** (upserted, never accumulated) from the trailing 24h of items, and only when a cycle produced new items.
+
+### Staleness / silent-failure detection (`src/staleness.ts`)
+
+A cycle that fetches fine but yields **zero** items is stored as `last_fetch_status = "ok"` — indistinguishable from a healthy quiet source, which is how a broken scrape hides behind a green dot and a recent "Updated 2m ago" (the failure mode behind the `user.legacy` regression). So `list_checkpoints` also tracks **`last_item_at`** (last *productive* cycle — only advanced when `markFetchDone` is passed a non-zero `newItemCount`) and **`watching_since`** (write-once first cycle, the baseline before a source has ever produced anything). Past the threshold with neither advancing, the source is stale.
+
+- **Thresholds**: default 12h, injected via `startTerminal({ stalenessThresholdHours })`. On by default only for `twitter_list`/`media_list`, where a dry spell means breakage; **off** for `rss_feed`/`website_diff`, where silence is the normal steady state. Per-source `stalenessThresholdHours` overrides either way (`0` silences, positive opts in).
+- **Suppressed** for sources whose last cycle actually errored — that already surfaces its own error, and a second alert would double-report one breakage. *Not* suppressed while `running`, or the alert would flicker every cycle.
+- **Surfaced twice**: `console.warn` from the scheduler's post-cycle hook (so a dead source is visible in logs without the UI open), and in the UI as a dismissible error snack (`components/SnackBar.tsx`), a hollow tab dot, and the toolbar status line.
+- The server sends only the raw inputs (threshold + the two timestamps) on `/api/lists`; the verdict is computed client-side in `frontend/src/staleness.ts` — a hand-mirror of the backend module — so the existing minute tick catches a source crossing its threshold without waiting for a server event. Snack dismissal is keyed to the *specific* dry spell (its start timestamp), so a source that recovers and breaks again re-alerts.
 
 ### LLM summarization (`src/summarizer.ts`)
 

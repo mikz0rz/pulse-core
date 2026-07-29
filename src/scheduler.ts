@@ -17,6 +17,7 @@ import {
   getCheckpoint,
   type ResolvedFeedItem,
 } from "./db.js";
+import { evaluateStaleness, resolveStalenessThresholdHours } from "./staleness.js";
 import type { TwitterListSourceConfig, Source, Tweet, ExtraSection, ListFetchStatus } from "./types.js";
 import type { FeatureFlags } from "./terminal-config.js";
 
@@ -159,7 +160,7 @@ export async function runSimpleSourceCycle(
     console.log(`[scheduler] ${id}: ${items.length} new item(s).`);
 
     if (items.length === 0) {
-      markFetchDone(id, "ok");
+      markFetchDone(id, "ok", { newItemCount: 0 });
       emitListUpdate(id, "ok", 0);
       return;
     }
@@ -168,11 +169,11 @@ export async function runSimpleSourceCycle(
     insertFeedItems(id, batchId, items);
     await refreshDigest(id, description);
 
-    markFetchDone(id, "ok");
+    markFetchDone(id, "ok", { newItemCount: items.length });
     emitListUpdate(id, "ok", items.length);
   } catch (error: any) {
     console.error(`[scheduler] Error processing ${id}:`, error);
-    markFetchDone(id, "error", String(error?.message ?? error));
+    markFetchDone(id, "error", { error: String(error?.message ?? error) });
     emitListUpdate(id, "error", 0);
   }
 }
@@ -195,7 +196,7 @@ export async function runListCycle(twitter: TwitterClient, config: TwitterListSo
     console.log(`[scheduler] List ${config.id}: fetched ${tweets.length}, ${newTweets.length} new.`);
 
     if (newTweets.length === 0) {
-      markFetchDone(config.id, "ok");
+      markFetchDone(config.id, "ok", { newItemCount: 0 });
       consecutiveFailures.set(config.id, 0);
       emitListUpdate(config.id, "ok", 0);
       return;
@@ -238,7 +239,7 @@ export async function runListCycle(twitter: TwitterClient, config: TwitterListSo
       await refreshSections(config.id, config.description, config.extraSections);
     }
 
-    markFetchDone(config.id, "ok");
+    markFetchDone(config.id, "ok", { newItemCount: resolved.length });
     consecutiveFailures.set(config.id, 0);
 
     emitListUpdate(config.id, "ok", resolved.length);
@@ -250,7 +251,7 @@ export async function runListCycle(twitter: TwitterClient, config: TwitterListSo
     const status = failures >= AUTH_FAILURE_THRESHOLD || looksLikeAuthFailure ? "auth_expired" : "error";
 
     console.error(`[scheduler] Error processing list ${config.id}:`, error);
-    markFetchDone(config.id, status, String(error?.message ?? error));
+    markFetchDone(config.id, status, { error: String(error?.message ?? error) });
     emitListUpdate(config.id, status, 0);
   }
 }
@@ -262,8 +263,29 @@ export function createTwitterListSource(twitter: TwitterClient, config: TwitterL
     type: "twitter_list",
     description: config.description,
     refreshIntervalMinutes: config.refreshIntervalMinutes ?? 30,
+    stalenessThresholdHours: resolveStalenessThresholdHours(config),
     runCycle: () => runListCycle(twitter, config),
   };
+}
+
+/**
+ * Logs a source that keeps completing cycles without producing anything —
+ * the server-side half of staleness reporting, so a silently-dead scrape is
+ * visible in the logs and not only to whoever has the UI open. The UI's own
+ * snack is driven from the same checkpoint fields via /api/lists.
+ */
+function reportStaleness(source: Source): void {
+  const state = evaluateStaleness(getCheckpoint(source.id), source.stalenessThresholdHours);
+  if (!state?.stale) return;
+
+  const hours = Math.floor(state.elapsedMs / (60 * 60 * 1000));
+  const detail = state.everProduced
+    ? `last new item ${hours}h ago (${state.sinceIso})`
+    : `never produced an item since ${state.sinceIso}`;
+  console.warn(
+    `[scheduler] ${source.id} looks stale: ${detail}, past its ${state.thresholdHours}h threshold, ` +
+      `yet cycles keep completing without error — the source is probably broken.`
+  );
 }
 
 /**
@@ -281,15 +303,22 @@ export function startScheduler(sources: Source[]): void {
     const effectiveMinutes = Math.min(source.refreshIntervalMinutes, MAX_REFRESH_INTERVAL_MINUTES);
     const intervalMs = effectiveMinutes * 60 * 1000;
 
+    // Both cycle runners catch their own errors, but a throw escaping one
+    // would otherwise kill this source's loop for the life of the process —
+    // so the reschedule is chained behind a catch, never in front of one.
+    const runCycle = (onDone: () => void) => {
+      source
+        .runCycle()
+        .then(() => reportStaleness(source))
+        .catch((error) => console.error(`[scheduler] Cycle for ${source.id} threw:`, error))
+        .then(onDone);
+    };
+
     const scheduleNext = () => {
-      setTimeout(() => {
-        source.runCycle().then(scheduleNext);
-      }, intervalMs);
+      setTimeout(() => runCycle(scheduleNext), intervalMs);
     };
 
     // Stagger initial kick-off so sources don't all hit the browser mutex at once.
-    setTimeout(() => {
-      source.runCycle().then(scheduleNext);
-    }, index * 5000);
+    setTimeout(() => runCycle(scheduleNext), index * 5000);
   });
 }

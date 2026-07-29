@@ -8,8 +8,10 @@ import { SectionBlock } from "./components/SectionBlock";
 import { SyncStatusBar } from "./components/SyncStatusBar";
 import { CategoryFilterBar } from "./components/CategoryFilterBar";
 import { TldrSection } from "./components/TldrSection";
+import { SnackBar, type Snack } from "./components/SnackBar";
 import { deriveCategoryCounts, groupByDay } from "./feedGrouping";
 import { loadReadIds, saveReadIds } from "./readState";
+import { findStaleSources, formatDrySpell, type StaleSource } from "./staleness";
 import { relativeTime } from "./utils";
 
 const FEED_LIMIT = 100;
@@ -67,7 +69,7 @@ function minutesLeftLabel(ms: number): string {
   return `${Math.max(1, Math.ceil(ms / 60000))} min`;
 }
 
-function statusLabel(checkpoint: ListCheckpoint | null | undefined): string {
+function statusLabel(checkpoint: ListCheckpoint | null | undefined, stale?: StaleSource | null): string {
   if (!checkpoint || !checkpoint.lastFetchStatus) return "Not yet refreshed";
   switch (checkpoint.lastFetchStatus) {
     case "running":
@@ -78,10 +80,32 @@ function statusLabel(checkpoint: ListCheckpoint | null | undefined): string {
       return `⚠️ Last refresh failed: ${checkpoint.lastError ?? "unknown error"}`;
     case "ok":
     default:
+      // A stale source refreshes fine and still shows nothing new, so the
+      // plain "Updated 2m ago" here would read as healthy. Say what's wrong.
+      if (stale) return `⚠️ Refreshing fine, but nothing new in ${formatDrySpell(stale.elapsedMs)}`;
       return checkpoint.lastFetchCompletedAt
         ? `Updated ${relativeTime(checkpoint.lastFetchCompletedAt)}`
         : "Up to date";
   }
+}
+
+/** Turns a dry spell into an alert that says what to actually check. */
+function staleSnack(stale: StaleSource, onShow: () => void): Snack {
+  const { list, elapsedMs, thresholdHours, everProduced, sinceIso } = stale;
+  return {
+    // Keyed by the dry spell's start, so dismissing this alert doesn't also
+    // pre-dismiss the next one if the source recovers and then breaks again.
+    id: `stale:${list.id}:${sinceIso}`,
+    tone: "error",
+    // The title carries the duration, so the detail says what to do about it
+    // rather than restating the same elapsed time in a second unit.
+    title: `${list.description}: nothing new in ${formatDrySpell(elapsedMs)}`,
+    detail: everProduced
+      ? `Refreshes keep completing without errors, so the source is likely broken — expected a story within ${thresholdHours}h.`
+      : `No story has ever come through since watching began — check this source's configuration.`,
+    actionLabel: "Show",
+    onAction: onShow,
+  };
 }
 
 function Feed({ title }: { title: string }) {
@@ -94,6 +118,10 @@ function Feed({ title }: { title: string }) {
   const [refreshing, setRefreshing] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [backoffNotice, setBackoffNotice] = useState<string | null>(null);
+  // Keyed by snack id (which embeds the dry spell's start), so a dismissal
+  // lasts for that dry spell only — a source that recovers and later goes
+  // stale again raises a fresh alert instead of staying silently dismissed.
+  const [dismissedAlerts, setDismissedAlerts] = useState<Record<string, true>>({});
   const [readIds, setReadIds] = useState<Set<number>>(() => loadReadIds());
   const [, setTick] = useState(0);
   const autoRefreshedRef = useRef(false);
@@ -229,7 +257,17 @@ function Feed({ title }: { title: string }) {
     window.location.reload();
   }
 
+  // Deliberately not memoized: staleness is a function of the clock, so it has
+  // to be recomputed on the minute tick above for a source to be caught
+  // crossing its threshold while the app sits open.
+  const staleSources = findStaleSources(lists);
+  const staleById = new Map(staleSources.map((s) => [s.list.id, s]));
+  const staleSnacks = staleSources
+    .map((s) => staleSnack(s, () => setSelected(s.list.id)))
+    .filter((s) => !dismissedAlerts[s.id]);
+
   const selectedList = lists.find((l) => l.id === selected);
+  const selectedStale = selected ? staleById.get(selected) ?? null : null;
   const selectedRunning = selectedList?.checkpoint?.lastFetchStatus === "running";
   const selectedBackoffMs = refreshBackoffMsLeft(selectedList?.checkpoint);
   const refreshDisabled = refreshing || selectedRunning || selectedBackoffMs > 0;
@@ -263,23 +301,30 @@ function Feed({ title }: { title: string }) {
         </button>
       </header>
 
-      <SyncStatusBar lists={lists} />
+      <SyncStatusBar lists={lists} stale={staleSources} />
 
       <nav className="list-tabs">
         {listGroups.map((group) => (
           <div key={group.type} className="list-group">
             <h2 className="list-group__title">{group.label}</h2>
             <div className="list-group__tabs">
-              {group.lists.map((l) => (
-                <button
-                  key={l.id}
-                  className={`list-tab ${l.id === selected ? "list-tab--active" : ""}`}
-                  onClick={() => setSelected(l.id)}
-                >
-                  <span className={`status-dot status-dot--${l.checkpoint?.lastFetchStatus ?? "unknown"}`} />
-                  <span className="list-tab__text">{l.description}</span>
-                </button>
-              ))}
+              {group.lists.map((l) => {
+                const status = l.checkpoint?.lastFetchStatus ?? "unknown";
+                // Staleness only ever coexists with ok/running (it's suppressed
+                // for failing sources), and while a refresh is actually in
+                // flight the running dot is the more useful signal.
+                const dot = staleById.has(l.id) && status !== "running" ? "stale" : status;
+                return (
+                  <button
+                    key={l.id}
+                    className={`list-tab ${l.id === selected ? "list-tab--active" : ""}`}
+                    onClick={() => setSelected(l.id)}
+                  >
+                    <span className={`status-dot status-dot--${dot}`} />
+                    <span className="list-tab__text">{l.description}</span>
+                  </button>
+                );
+              })}
             </div>
           </div>
         ))}
@@ -300,7 +345,9 @@ function Feed({ title }: { title: string }) {
             day{dayGroups.length === 1 ? "" : "s"}
             {unreadCount > 0 && <span className="feed-toolbar__unread">{unreadCount} unread</span>}
           </span>
-          <span className="feed-toolbar__status">{statusLabel(selectedList.checkpoint)}</span>
+          <span className={`feed-toolbar__status ${selectedStale ? "feed-toolbar__status--stale" : ""}`}>
+            {statusLabel(selectedList.checkpoint, selectedStale)}
+          </span>
           {backoffNotice && <span className="feed-toolbar__backoff">{backoffNotice}</span>}
           <button
             className="feed-toolbar__markread"
@@ -353,6 +400,11 @@ function Feed({ title }: { title: string }) {
           </section>
         ))}
       </main>
+
+      <SnackBar
+        snacks={staleSnacks}
+        onDismiss={(id) => setDismissedAlerts((prev) => ({ ...prev, [id]: true }))}
+      />
     </div>
   );
 }

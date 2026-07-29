@@ -63,6 +63,14 @@ export interface StartTerminalOptions {
   twitter: TwitterCredentials;
   huggingNewsApiKey?: string;
   sources: SourceConfig[];
+  /**
+   * Hours a source may go without a single new item before the UI reports it
+   * stale (defaults to 12). Applies to the source types where a dry spell
+   * means breakage rather than quiet — see staleness.ts — and is overridable
+   * per source via SourceConfig.stalenessThresholdHours. 0 disables the
+   * default entirely, leaving only per-source opt-ins.
+   */
+  stalenessThresholdHours?: number;
   features: FeatureFlags;
   branding: Branding;
   extensions?: TerminalExtensions;

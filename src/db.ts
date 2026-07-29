@@ -57,7 +57,9 @@ export function initDb(dbPath: string): void {
       last_fetch_started_at TEXT,
       last_fetch_completed_at TEXT,
       last_fetch_status TEXT,
-      last_error TEXT
+      last_error TEXT,
+      last_item_at TEXT,
+      watching_since TEXT
     );
 
     CREATE TABLE IF NOT EXISTS list_digests (
@@ -96,6 +98,30 @@ export function initDb(dbPath: string): void {
   db.exec(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_feed_items_external ON feed_items(list_id, external_id) WHERE external_id IS NOT NULL"
   );
+
+  // Staleness tracking (see staleness.ts) added after the fact, so existing
+  // databases get the columns here. Both are backfilled from the feed itself
+  // rather than left NULL — otherwise every already-broken source would look
+  // freshly-watched and stay unreported for another threshold window.
+  const checkpointColumns = db.prepare("PRAGMA table_info(list_checkpoints)").all() as Array<{ name: string }>;
+  const hasCheckpointColumn = (name: string) => checkpointColumns.some((c) => c.name === name);
+  if (!hasCheckpointColumn("last_item_at")) {
+    db.exec("ALTER TABLE list_checkpoints ADD COLUMN last_item_at TEXT");
+    db.exec(`
+      UPDATE list_checkpoints SET last_item_at =
+        (SELECT MAX(created_at) FROM feed_items WHERE feed_items.list_id = list_checkpoints.list_id)
+    `);
+  }
+  if (!hasCheckpointColumn("watching_since")) {
+    db.exec("ALTER TABLE list_checkpoints ADD COLUMN watching_since TEXT");
+    db.exec(`
+      UPDATE list_checkpoints SET watching_since = COALESCE(
+        (SELECT MIN(created_at) FROM feed_items WHERE feed_items.list_id = list_checkpoints.list_id),
+        last_fetch_completed_at,
+        last_fetch_started_at
+      )
+    `);
+  }
 
   normalizeCategoryCasingDuplicates();
 
@@ -148,13 +174,19 @@ export function initDb(dbPath: string): void {
   });
   existingExternalIdStmt = db.prepare("SELECT 1 FROM feed_items WHERE list_id = ? AND external_id = ?");
   upsertCheckpointStmt = db.prepare(`
-    INSERT INTO list_checkpoints (list_id, last_fetch_started_at, last_fetch_completed_at, last_fetch_status, last_error)
-    VALUES (@list_id, @last_fetch_started_at, @last_fetch_completed_at, @last_fetch_status, @last_error)
+    INSERT INTO list_checkpoints
+      (list_id, last_fetch_started_at, last_fetch_completed_at, last_fetch_status, last_error, last_item_at, watching_since)
+    VALUES
+      (@list_id, @last_fetch_started_at, @last_fetch_completed_at, @last_fetch_status, @last_error, @last_item_at, @watching_since)
     ON CONFLICT(list_id) DO UPDATE SET
       last_fetch_started_at = COALESCE(excluded.last_fetch_started_at, last_fetch_started_at),
       last_fetch_completed_at = COALESCE(excluded.last_fetch_completed_at, last_fetch_completed_at),
       last_fetch_status = COALESCE(excluded.last_fetch_status, last_fetch_status),
-      last_error = excluded.last_error
+      last_error = excluded.last_error,
+      last_item_at = COALESCE(excluded.last_item_at, last_item_at),
+      -- Reversed COALESCE vs. the rest: watching_since is write-once, so the
+      -- existing value wins and every later cycle leaves it untouched.
+      watching_since = COALESCE(watching_since, excluded.watching_since)
   `);
   upsertDigestStmt = db.prepare(`
     INSERT INTO list_digests (list_id, summary, generated_at, item_count)
@@ -326,6 +358,8 @@ function rowToCheckpoint(row: any): ListCheckpoint {
     lastFetchCompletedAt: row.last_fetch_completed_at ?? undefined,
     lastFetchStatus: row.last_fetch_status ?? undefined,
     lastError: row.last_error ?? undefined,
+    lastItemAt: row.last_item_at ?? undefined,
+    watchingSince: row.watching_since ?? undefined,
   };
 }
 
@@ -340,22 +374,39 @@ export function getAllCheckpoints(): ListCheckpoint[] {
 }
 
 export function markFetchRunning(listId: string): void {
+  const now = new Date().toISOString();
   upsertCheckpointStmt.run({
     list_id: listId,
-    last_fetch_started_at: new Date().toISOString(),
+    last_fetch_started_at: now,
     last_fetch_completed_at: null,
     last_fetch_status: "running" as ListFetchStatus,
     last_error: null,
+    last_item_at: null, // NULL keeps the stored value (see the upsert's COALESCE)
+    watching_since: now, // write-once: only lands on the source's very first cycle
   });
 }
 
-export function markFetchDone(listId: string, status: ListFetchStatus, error?: string): void {
+export interface FetchDoneOptions {
+  error?: string;
+  /**
+   * How many items this cycle actually inserted. A positive count is what
+   * advances `last_item_at` — 0 deliberately leaves it where it was, which is
+   * how a run of empty-but-successful cycles becomes visible as staleness.
+   */
+  newItemCount?: number;
+}
+
+export function markFetchDone(listId: string, status: ListFetchStatus, opts: FetchDoneOptions = {}): void {
+  const now = new Date().toISOString();
+  const produced = (opts.newItemCount ?? 0) > 0;
   upsertCheckpointStmt.run({
     list_id: listId,
     last_fetch_started_at: null,
-    last_fetch_completed_at: new Date().toISOString(),
+    last_fetch_completed_at: now,
     last_fetch_status: status,
-    last_error: error ?? null,
+    last_error: opts.error ?? null,
+    last_item_at: produced ? now : null,
+    watching_since: now,
   });
 }
 

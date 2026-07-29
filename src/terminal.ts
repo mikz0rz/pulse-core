@@ -14,6 +14,7 @@ import {
 import { loginHandler, logoutHandler, sessionStatusHandler, requireAuth, configureAuth } from "./auth.js";
 import { configureSummarizer } from "./summarizer.js";
 import { configureHuggingNews } from "./huggingnews.js";
+import { configureStaleness } from "./staleness.js";
 import { closeWebsiteBrowser } from "./website-watch.js";
 import type { Source } from "./types.js";
 import type { StartTerminalOptions } from "./terminal-config.js";
@@ -37,6 +38,7 @@ export function startTerminal(options: StartTerminalOptions): void {
     secureCookie: options.secureCookie ?? false,
   });
   configureHuggingNews(options.huggingNewsApiKey);
+  configureStaleness(options.stalenessThresholdHours);
   configureScheduler(options.features);
 
   const twitter = new TwitterClient(options.twitter.authToken, options.twitter.ct0);
@@ -69,6 +71,11 @@ export function startTerminal(options: StartTerminalOptions): void {
         type: s.type,
         description: s.description,
         refreshIntervalMinutes: s.refreshIntervalMinutes,
+        // The client derives "is it stale?" itself from this threshold plus
+        // the checkpoint's lastItemAt/watchingSince, the same way it derives
+        // the refresh backoff — so it can re-evaluate on its own clock tick
+        // as a source crosses the threshold between server events.
+        stalenessThresholdHours: s.stalenessThresholdHours,
         checkpoint: checkpoints.get(s.id) ?? null,
       }))
     );

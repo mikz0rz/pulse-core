@@ -24,6 +24,10 @@ export interface ListCheckpoint {
   lastFetchCompletedAt?: string;
   lastFetchStatus?: ListFetchStatus;
   lastError?: string;
+  /** When a cycle last produced new items — NOT when one last completed. Drives staleness (see staleness.ts). */
+  lastItemAt?: string;
+  /** First cycle ever recorded for this source; the staleness baseline before it produces anything. */
+  watchingSince?: string;
 }
 
 export interface ListSummary {
@@ -31,6 +35,8 @@ export interface ListSummary {
   type: SourceType;
   description: string;
   refreshIntervalMinutes: number;
+  /** Hours without a new item before this source counts as stale; null when staleness alerting is off for it. */
+  stalenessThresholdHours: number | null;
   checkpoint: ListCheckpoint | null;
 }
 

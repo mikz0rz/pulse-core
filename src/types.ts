@@ -66,6 +66,13 @@ interface BaseSourceConfig {
   description: string;
   refreshIntervalMinutes?: number;
   enabled: boolean;
+  /**
+   * Hours without a single new item before this source is reported stale in
+   * the UI. Overrides the deployment default (see staleness.ts): 0 silences
+   * alerting for this source, a positive value opts in a type that's off by
+   * default (rss_feed / website_diff, where silence is normal).
+   */
+  stalenessThresholdHours?: number;
 }
 
 export interface TwitterListSourceConfig extends BaseSourceConfig {
@@ -134,6 +141,14 @@ export interface ListCheckpoint {
   lastFetchCompletedAt?: string;
   lastFetchStatus?: ListFetchStatus;
   lastError?: string;
+  /**
+   * When a cycle last actually produced new items. Distinct from
+   * lastFetchCompletedAt — a source can complete "ok" forever while silently
+   * returning nothing, which is what staleness.ts detects.
+   */
+  lastItemAt?: string;
+  /** First cycle ever recorded for this source; the staleness baseline before it produces anything. */
+  watchingSince?: string;
 }
 
 export interface ListDigest {
@@ -161,5 +176,7 @@ export interface Source {
   type: SourceType;
   description: string;
   refreshIntervalMinutes: number;
+  /** Resolved dry-spell threshold (resolveStalenessThresholdHours), or null when staleness alerting is off. */
+  stalenessThresholdHours: number | null;
   runCycle(): Promise<void>;
 }

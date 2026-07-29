@@ -14,6 +14,7 @@ import {
   type ResolvedFeedItem,
 } from "./db.js";
 import { runSimpleSourceCycle } from "./scheduler.js";
+import { resolveStalenessThresholdHours } from "./staleness.js";
 import { summarizeWebsiteDiff } from "./summarizer.js";
 import type { RssFeedSourceConfig, Source, WebsiteDiffSourceConfig } from "./types.js";
 
@@ -184,6 +185,7 @@ export function createRssFeedSource(config: RssFeedSourceConfig): Source {
     type: "rss_feed",
     description: config.description,
     refreshIntervalMinutes: config.refreshIntervalMinutes ?? 60,
+    stalenessThresholdHours: resolveStalenessThresholdHours(config),
     runCycle: () => runSimpleSourceCycle(config.id, config.description, () => checkFeedSite(config)),
   };
 }
@@ -195,6 +197,7 @@ export function createWebsiteDiffSource(config: WebsiteDiffSourceConfig): Source
     type: "website_diff",
     description: config.description,
     refreshIntervalMinutes: config.refreshIntervalMinutes ?? 180,
+    stalenessThresholdHours: resolveStalenessThresholdHours(config),
     runCycle: () => runSimpleSourceCycle(config.id, config.description, () => checkDiffSite(config)),
   };
 }
