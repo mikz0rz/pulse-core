@@ -410,8 +410,6 @@ export class TwitterClient {
       const core = tweet?.core?.user_results?.result;
       const userLegacy = core?.legacy;
 
-      if (!legacy || !userLegacy) return null;
-
       // X's GraphQL User object shape is inconsistent across endpoints: some
       // (e.g. UserByScreenName) still nest screen_name/name/avatar under
       // `legacy`, while others (e.g. tweet-embedded users from list/home/user
@@ -419,6 +417,12 @@ export class TwitterClient {
       // Prefer the newer shape, falling back to `legacy` for endpoints that
       // haven't migrated.
       const userCore = core?.core;
+
+      // List timelines have now dropped `legacy` from the user object entirely
+      // (tweet-level `legacy` is still there). Requiring it here rejected every
+      // tweet in a list feed, which surfaced as a silent "fetched 0" rather than
+      // an error — so accept either user shape, and only bail if both are gone.
+      if (!legacy || (!userLegacy && !userCore)) return null;
       const media =
         legacy.extended_entities?.media?.map((m: any) => ({
           type: m.type,
@@ -430,11 +434,11 @@ export class TwitterClient {
         id: legacy.id_str || tweet.rest_id,
         text: legacy.full_text || legacy.text || "",
         author: {
-          id: core.rest_id,
-          username: userCore?.screen_name ?? userLegacy.screen_name,
-          name: userCore?.name ?? userLegacy.name,
-          profile_image_url: core?.avatar?.image_url ?? userLegacy.profile_image_url_https,
-          verified: core.is_blue_verified ?? false,
+          id: core?.rest_id,
+          username: userCore?.screen_name ?? userLegacy?.screen_name,
+          name: userCore?.name ?? userLegacy?.name,
+          profile_image_url: core?.avatar?.image_url ?? userLegacy?.profile_image_url_https,
+          verified: core?.is_blue_verified ?? false,
         },
         created_at: legacy.created_at,
         likes: legacy.favorite_count ?? 0,
