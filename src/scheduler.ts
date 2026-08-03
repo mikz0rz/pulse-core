@@ -23,6 +23,23 @@ import type { FeatureFlags } from "./terminal-config.js";
 
 export const schedulerEvents = new EventEmitter();
 
+function sanitizeErrorForClient(error: unknown): string {
+  const message =
+    typeof error === "object" && error !== null && "message" in error
+      ? String((error as { message: unknown }).message)
+      : String(error);
+  // LLM and Twitter responses can contain sensitive snippets; keep the full
+  // message in server logs, but send a generic label to the UI.
+  if (/OpenAI API error|Gemini API error|Twitter API error|LLM did not return valid/i.test(message)) {
+    return "External service returned an error";
+  }
+  if (/fetch failed|ENOTFOUND|ETIMEDOUT|ECONNRESET/i.test(message)) {
+    return "Network error while fetching source";
+  }
+  // Everything else: truncate to a reasonable length and strip control chars.
+  return message.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 200);
+}
+
 /**
  * Pushes a list's state change to any connected client via the `list-updated`
  * SSE event (relayed in terminal.ts). Emitted on EVERY meaningful checkpoint
@@ -173,7 +190,7 @@ export async function runSimpleSourceCycle(
     emitListUpdate(id, "ok", items.length);
   } catch (error: any) {
     console.error(`[scheduler] Error processing ${id}:`, error);
-    markFetchDone(id, "error", { error: String(error?.message ?? error) });
+    markFetchDone(id, "error", { error: sanitizeErrorForClient(error) });
     emitListUpdate(id, "error", 0);
   }
 }
@@ -251,7 +268,7 @@ export async function runListCycle(twitter: TwitterClient, config: TwitterListSo
     const status = failures >= AUTH_FAILURE_THRESHOLD || looksLikeAuthFailure ? "auth_expired" : "error";
 
     console.error(`[scheduler] Error processing list ${config.id}:`, error);
-    markFetchDone(config.id, status, { error: String(error?.message ?? error) });
+    markFetchDone(config.id, status, { error: sanitizeErrorForClient(error) });
     emitListUpdate(config.id, status, 0);
   }
 }

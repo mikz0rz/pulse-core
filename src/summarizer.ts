@@ -219,10 +219,10 @@ async function callGemini(prompt: string, geminiSchema: object | null): Promise<
   const apiKey = llmConfig.apiKey;
   const modelId = llmConfig.modelId || "gemini-3.1-pro-preview";
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: geminiSchema

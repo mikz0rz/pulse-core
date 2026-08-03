@@ -1,4 +1,5 @@
 import express from "express";
+import helmet from "helmet";
 import path from "path";
 import { fileURLToPath } from "url";
 import { TwitterClient } from "./twitter-client.js";
@@ -11,7 +12,7 @@ import {
   getDigest,
   getSections,
 } from "./db.js";
-import { loginHandler, logoutHandler, sessionStatusHandler, requireAuth, configureAuth } from "./auth.js";
+import { loginHandler, logoutHandler, sessionStatusHandler, requireAuth, requireCsrfToken, configureAuth } from "./auth.js";
 import { configureSummarizer } from "./summarizer.js";
 import { configureHuggingNews } from "./huggingnews.js";
 import { configureStaleness } from "./staleness.js";
@@ -24,18 +25,36 @@ import type { StartTerminalOptions } from "./terminal-config.js";
 // pulse-core is installed as a dependency in another repo.
 const FRONTEND_DIST = fileURLToPath(new URL("../frontend/dist", import.meta.url));
 
+function validateSecrets(appPassword: string, sessionSecret: string, secureCookie: boolean): void {
+  if (appPassword.length < 8) {
+    throw new Error("appPassword must be at least 8 characters long");
+  }
+  if (sessionSecret.length < 32) {
+    throw new Error("sessionSecret must be at least 32 characters long");
+  }
+  if (!secureCookie) {
+    console.warn(
+      "[terminal] secureCookie is false — the session cookie will be sent over plaintext HTTP. " +
+        "Set secureCookie to true when running behind TLS."
+    );
+  }
+}
+
 /**
  * Boots the whole news-terminal engine: persistence, scheduler, and the
  * password-protected web feed. Every secret and toggle is passed in via
  * `options`; the core reads nothing from the environment itself.
  */
 export function startTerminal(options: StartTerminalOptions): void {
+  const secureCookie = options.secureCookie ?? true;
+  validateSecrets(options.appPassword, options.sessionSecret, secureCookie);
+
   initDb(options.dbPath);
   configureSummarizer(options.llm, options.extensions?.prompts);
   configureAuth({
     appPassword: options.appPassword,
     sessionSecret: options.sessionSecret,
-    secureCookie: options.secureCookie ?? false,
+    secureCookie,
   });
   configureHuggingNews(options.huggingNewsApiKey);
   configureStaleness(options.stalenessThresholdHours);
@@ -50,11 +69,32 @@ export function startTerminal(options: StartTerminalOptions): void {
   const app = express();
   // Behind a reverse proxy — without this req.ip is the proxy's address for
   // every request, collapsing auth.ts's per-IP login rate limit into one bucket.
+  // The proxy must sanitize untrusted X-Forwarded-For values; otherwise clients
+  // can spoof req.ip and share or evade the rate-limit bucket.
   app.set("trust proxy", 1);
   app.use(express.json());
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: ["'self'"],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          connectSrc: ["'self'"],
+          imgSrc: ["'self'", "https:"],
+          fontSrc: ["'self'"],
+          frameAncestors: ["'none'"],
+          baseUri: ["'self'"],
+          formAction: ["'self'"],
+        },
+      },
+      crossOriginEmbedderPolicy: false,
+      xFrameOptions: { action: "deny" },
+    })
+  );
 
   app.post("/api/login", loginHandler);
-  app.post("/api/logout", logoutHandler);
+  app.post("/api/logout", requireCsrfToken, logoutHandler);
   app.get("/api/session", sessionStatusHandler);
 
   // Public (pre-auth) branding so the login screen can render the variant's
@@ -109,7 +149,7 @@ export function startTerminal(options: StartTerminalOptions): void {
     res.json(getSections(listId));
   });
 
-  app.post("/api/lists/:id/refresh", requireAuth, (req, res) => {
+  app.post("/api/lists/:id/refresh", requireAuth, requireCsrfToken, (req, res) => {
     const source = sources.find((s) => s.id === req.params.id);
     if (!source) {
       res.status(404).json({ error: "Unknown list id" });
@@ -158,7 +198,14 @@ export function startTerminal(options: StartTerminalOptions): void {
   });
 
   app.use(express.static(FRONTEND_DIST));
-  app.get(/^(?!\/api\/).*/, (_req, res) => {
+  // SPA fallback: serve index.html for any non-API path. Use a middleware
+  // instead of a route pattern so Express 5's path-to-regexp doesn't choke
+  // on a bare wildcard, and explicitly skip decoded /api/ paths so encoded
+  // variants like /api%2f... do not fall through to the SPA index.html.
+  app.use((req, res, next) => {
+    if (req.path.startsWith("/api/")) {
+      return next();
+    }
     res.sendFile(path.join(FRONTEND_DIST, "index.html"));
   });
 

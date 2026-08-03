@@ -28,6 +28,17 @@ const MAX_DIFF_CHARS = 6_000;
 
 const rssParser = new Parser();
 
+/** Accepts only http/https URLs with a non-empty hostname. */
+export function isAllowedHttpUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 // Independent from TwitterClient's browser: that one is tightly bound to an
 // authenticated x.com session and shouldn't navigate to third-party domains.
 // A fresh Page per check (not reused) means no session state to preserve
@@ -37,6 +48,10 @@ let browser: Browser | null = null;
 async function getBrowser(): Promise<Browser> {
   if (browser?.connected) return browser;
   console.log("[website-watch] Launching browser...");
+  // SECURITY NOTE: sandbox flags are disabled because many deployments run in
+  // containers where the Chrome sandbox is unavailable. This weakens renderer
+  // isolation; only validated http/https URLs from trusted sources should be
+  // navigated, and the host should use a user namespace or seccomp profile.
   browser = await puppeteer.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
@@ -106,6 +121,9 @@ function buildDiffText(oldText: string, newText: string): string {
  * the feed's own title/description is trusted, same as HuggingNews.
  */
 async function checkFeedSite(config: RssFeedSourceConfig): Promise<ResolvedFeedItem[]> {
+  if (!isAllowedHttpUrl(config.feedUrl)) {
+    throw new Error(`Invalid feedUrl for ${config.id}: only http/https URLs are allowed`);
+  }
   const feed = await rssParser.parseURL(config.feedUrl);
   const items: ResolvedFeedItem[] = [];
 
@@ -114,13 +132,19 @@ async function checkFeedSite(config: RssFeedSourceConfig): Promise<ResolvedFeedI
     if (!externalId || hasExternalFeedItem(config.id, externalId)) continue;
 
     const summary = item.contentSnippet ?? stripHtml(item.content ?? item.summary ?? "");
+    const sourceUrls: string[] = [];
+    if (item.link && isAllowedHttpUrl(item.link)) {
+      sourceUrls.push(item.link);
+    } else if (item.link) {
+      console.warn(`[website-watch] ${config.id}: skipping non-http(s) link "${item.link}"`);
+    }
     items.push({
       type: "tweet_update",
       headline: item.title ?? "Untitled post",
       summary,
       tags: [],
       sourceTweetIds: [],
-      sourceUrls: item.link ? [item.link] : [],
+      sourceUrls,
       itemTimestamp: item.isoDate ?? new Date().toISOString(),
       externalId,
     });
@@ -137,6 +161,9 @@ async function checkFeedSite(config: RssFeedSourceConfig): Promise<ResolvedFeedI
  * diff, which the LLM turns into one readable "what changed" feed item.
  */
 async function checkDiffSite(config: WebsiteDiffSourceConfig): Promise<ResolvedFeedItem[]> {
+  if (!isAllowedHttpUrl(config.url)) {
+    throw new Error(`Invalid url for ${config.id}: only http/https URLs are allowed`);
+  }
   const newText = await fetchRenderedText(config.url, config.selector);
   const contentHash = createHash("sha256").update(newText).digest("hex");
 
@@ -180,6 +207,12 @@ async function checkDiffSite(config: WebsiteDiffSourceConfig): Promise<ResolvedF
 
 /** Registers a blog/changelog RSS feed as a Source. Cheap to poll (~60min default) — just an XML fetch. */
 export function createRssFeedSource(config: RssFeedSourceConfig): Source {
+  if (!isAllowedHttpUrl(config.feedUrl)) {
+    throw new Error(`rss_feed source "${config.id}" has an invalid feedUrl: only http/https URLs are allowed`);
+  }
+  if (config.url && !isAllowedHttpUrl(config.url)) {
+    throw new Error(`rss_feed source "${config.id}" has an invalid url: only http/https URLs are allowed`);
+  }
   return {
     id: config.id,
     type: "rss_feed",
@@ -192,6 +225,9 @@ export function createRssFeedSource(config: RssFeedSourceConfig): Source {
 
 /** Registers a watched page as a Source. Conservative default interval (~3h) since each check is a full JS-rendered page load. */
 export function createWebsiteDiffSource(config: WebsiteDiffSourceConfig): Source {
+  if (!isAllowedHttpUrl(config.url)) {
+    throw new Error(`website_diff source "${config.id}" has an invalid url: only http/https URLs are allowed`);
+  }
   return {
     id: config.id,
     type: "website_diff",

@@ -54,11 +54,22 @@ export interface ListSection {
   generatedAt: string;
 }
 
+function getCsrfToken(): string | undefined {
+  return document.cookie
+    .split(";")
+    .map((c) => c.trim())
+    .find((c) => c.startsWith("pulse_csrf="))
+    ?.split("=")[1];
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
-  });
+  const method = init?.method?.toUpperCase() ?? "GET";
+  const csrfToken = method !== "GET" && method !== "HEAD" && method !== "OPTIONS" ? getCsrfToken() : undefined;
+  const headers = new Headers(init?.headers);
+  headers.set("Content-Type", "application/json");
+  if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
+
+  const res = await fetch(path, { ...init, headers });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || `Request failed: ${res.status}`);

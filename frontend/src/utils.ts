@@ -28,3 +28,14 @@ export function dayLabel(iso: string): string {
 export function isWithinHours(iso: string, hours: number): boolean {
   return Date.now() - new Date(iso).getTime() < hours * 3600 * 1000;
 }
+
+/** Accepts only http/https URLs with a non-empty hostname. */
+export function isHttpUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}

@@ -3,7 +3,7 @@
 //
 //   npm install && npm run build
 //   TWITTER_AUTH_TOKEN=... TWITTER_CT0=... GEMINI_API_KEY=... \
-//     APP_PASSWORD=changeme SESSION_SECRET=$(openssl rand -hex 32) \
+//     APP_PASSWORD=<strong-min-8-char-password> SESSION_SECRET=$(openssl rand -hex 32) \
 //     node build/examples/standalone.js
 //
 // (This file lives in the public repo only as documentation — the engine
@@ -23,11 +23,20 @@ const sources: SourceConfig[] = [
   },
 ];
 
+const APP_PASSWORD = process.env.APP_PASSWORD;
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (!APP_PASSWORD) {
+  throw new Error("APP_PASSWORD environment variable is required");
+}
+if (!SESSION_SECRET) {
+  throw new Error("SESSION_SECRET environment variable is required");
+}
+
 startTerminal({
   port: Number(process.env.PORT || 3000),
   dbPath: process.env.DB_PATH || "./pulse.db",
-  appPassword: process.env.APP_PASSWORD || "changeme",
-  sessionSecret: process.env.SESSION_SECRET || "dev-secret-change-me",
+  appPassword: APP_PASSWORD,
+  sessionSecret: SESSION_SECRET,
   secureCookie: process.env.NODE_ENV === "production",
   llm: {
     provider: (process.env.LLM_PROVIDER as "openai" | "gemini") || "gemini",

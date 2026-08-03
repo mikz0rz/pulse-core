@@ -78,6 +78,10 @@ export class TwitterClient {
     if (this.page && this.browser?.connected) return this.page;
 
     console.error("[twitter-mcp] Launching stealth browser...");
+    // SECURITY NOTE: sandbox flags are disabled because many deployments run in
+    // containers where the Chrome sandbox is unavailable. This weakens renderer
+    // isolation; the host should use a user namespace or seccomp profile where
+    // possible, and the browser should only navigate to trusted x.com pages.
     this.browser = await puppeteer.launch({
       headless: true,
       args: [

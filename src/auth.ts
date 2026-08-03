@@ -1,7 +1,8 @@
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHmac, timingSafeEqual, randomBytes } from "crypto";
 import type { Request, Response, NextFunction } from "express";
 
 const SESSION_COOKIE_NAME = "pulse_session";
+const CSRF_COOKIE_NAME = "pulse_csrf";
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 // Injected once by startTerminal — the core never reads these from the env.
@@ -52,6 +53,45 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return cookies;
 }
 
+function generateCsrfToken(): string {
+  return randomBytes(32).toString("hex");
+}
+
+function setCsrfCookie(res: Response, token: string, secure: boolean): void {
+  res.cookie(CSRF_COOKIE_NAME, token, {
+    httpOnly: false,
+    secure,
+    sameSite: "strict",
+    maxAge: SESSION_TTL_MS,
+  });
+}
+
+function getCsrfCookieValue(req: Request): string | undefined {
+  return parseCookies(req.headers.cookie)[CSRF_COOKIE_NAME];
+}
+
+function csrfTokenMatches(req: Request): boolean {
+  const cookieToken = getCsrfCookieValue(req);
+  const headerToken = req.headers["x-csrf-token"];
+  if (!cookieToken || typeof headerToken !== "string" || headerToken.length === 0) return false;
+  const a = Buffer.from(cookieToken);
+  const b = Buffer.from(headerToken);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+export function requireCsrfToken(req: Request, res: Response, next: NextFunction): void {
+  const method = req.method.toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    next();
+    return;
+  }
+  if (!csrfTokenMatches(req)) {
+    res.status(403).json({ error: "Invalid or missing CSRF token" });
+    return;
+  }
+  next();
+}
+
 // Single-user tool exposed on the open internet — a small in-memory limiter
 // on /login is cheap insurance, not a full rate-limiting subsystem.
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -70,7 +110,10 @@ function isRateLimited(key: string): boolean {
 }
 
 export function loginHandler(req: Request, res: Response): void {
-  const key = req.ip ?? "unknown";
+  // req.ip is the leftmost X-Forwarded-For entry when trust proxy is set; if
+  // the proxy is not configured to strip untrusted values, fall back to the
+  // raw TCP remote address so the rate limit bucket is not shared globally.
+  const key = req.ip ?? req.socket.remoteAddress ?? "unknown";
   if (isRateLimited(key)) {
     res.status(429).json({ error: "Too many attempts, try again later." });
     return;
@@ -90,9 +133,10 @@ export function loginHandler(req: Request, res: Response): void {
   res.cookie(SESSION_COOKIE_NAME, buildSessionValue(), {
     httpOnly: true,
     secure: authConfig.secureCookie,
-    sameSite: "lax",
+    sameSite: "strict",
     maxAge: SESSION_TTL_MS,
   });
+  setCsrfCookie(res, generateCsrfToken(), authConfig.secureCookie);
   res.json({ ok: true });
 }
 
@@ -109,6 +153,10 @@ export function sessionStatusHandler(req: Request, res: Response): void {
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const cookies = parseCookies(req.headers.cookie);
   if (isValidSessionValue(cookies[SESSION_COOKIE_NAME])) {
+    // Ensure existing sessions that predate the CSRF cookie get one.
+    if (!cookies[CSRF_COOKIE_NAME]) {
+      setCsrfCookie(res, generateCsrfToken(), authConfig.secureCookie);
+    }
     next();
     return;
   }

@@ -279,6 +279,15 @@ export function hasExternalFeedItem(listId: string, externalId: string): boolean
   return Boolean(existingExternalIdStmt.get(listId, externalId));
 }
 
+function safeParseJson<T>(value: string | undefined, defaultValue: T, rowId: number, column: string): T {
+  try {
+    return JSON.parse(value ?? JSON.stringify(defaultValue)) as T;
+  } catch {
+    console.warn(`[db] Corrupt JSON in feed_items.${column} for row ${rowId}: ${value?.slice(0, 100)}`);
+    return defaultValue;
+  }
+}
+
 function rowToFeedItem(row: any): FeedItem {
   return {
     id: row.id,
@@ -289,9 +298,9 @@ function rowToFeedItem(row: any): FeedItem {
     headline: row.headline,
     summary: row.summary ?? "",
     category: row.category ?? undefined,
-    tags: JSON.parse(row.tags_json ?? "[]"),
-    sourceTweetIds: JSON.parse(row.source_tweet_ids_json ?? "[]"),
-    sourceUrls: JSON.parse(row.source_urls_json ?? "[]"),
+    tags: safeParseJson(row.tags_json, [], row.id, "tags_json"),
+    sourceTweetIds: safeParseJson(row.source_tweet_ids_json, [], row.id, "source_tweet_ids_json"),
+    sourceUrls: safeParseJson(row.source_urls_json, [], row.id, "source_urls_json"),
     itemTimestamp: row.item_timestamp,
     createdAt: row.created_at,
   };

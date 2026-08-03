@@ -1,5 +1,5 @@
 import type { FeedItem } from "../api";
-import { relativeTime, isWithinHours } from "../utils";
+import { relativeTime, isWithinHours, isHttpUrl } from "../utils";
 
 export function StoryRow({
   item,
@@ -18,7 +18,7 @@ export function StoryRow({
 }) {
   const trending = item.sourceUrls.length >= 3;
   const isRecent = isWithinHours(item.itemTimestamp, 3);
-  const primaryUrl = item.sourceUrls[0];
+  const primaryUrl = isHttpUrl(item.sourceUrls[0]) ? item.sourceUrls[0] : undefined;
 
   return (
     <div

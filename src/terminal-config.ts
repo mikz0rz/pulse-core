@@ -57,7 +57,10 @@ export interface StartTerminalOptions {
   dbPath: string;
   appPassword: string;
   sessionSecret: string;
-  /** Set the session cookie's Secure flag (true behind TLS in production). */
+  /**
+   * Set the session cookie's Secure flag. Defaults to true; deployments without
+   * TLS must explicitly set this to false (not recommended for production).
+   */
   secureCookie?: boolean;
   llm: LlmConfig;
   twitter: TwitterCredentials;
