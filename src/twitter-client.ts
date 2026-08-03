@@ -116,10 +116,25 @@ export class TwitterClient {
       },
     );
 
-    await this.page.goto("https://x.com/home", {
-      waitUntil: "networkidle2",
-      timeout: 30000,
-    });
+    // The auth landing only needs to load far enough for x.com to accept our
+    // cookies and hand back a fresh ct0 — we never scrape it. x.com/home is a
+    // heavy page that keeps background network activity alive, so `networkidle2`
+    // routinely misses its window on a cold-start / constrained VPS and throws,
+    // costing the first scheduled list its cycle even though the browser is
+    // usable. Wait only for `domcontentloaded`, give it a generous timeout, and
+    // treat a navigation timeout as non-fatal: the DOM is up and the cookies are
+    // set regardless.
+    try {
+      await this.page.goto("https://x.com/home", {
+        waitUntil: "domcontentloaded",
+        timeout: 60000,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(
+        `[twitter-mcp] Initial x.com/home navigation did not settle (${msg}); continuing — page is usable for scraping.`,
+      );
+    }
 
     // Refresh ct0 from browser
     const cookies = await this.page.cookies("https://x.com");
