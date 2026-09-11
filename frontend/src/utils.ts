@@ -9,9 +9,14 @@ export function relativeTime(iso: string): string {
   return `${days}d ago`;
 }
 
+// Zero-padded so the lexicographic sort in groupByDay matches chronological
+// order — unpadded keys like "2026-8-9" > "2026-8-10" as strings, which pinned
+// the Sep 9 group above all later days the moment the month hit double digits.
 export function dayKey(iso: string): string {
   const d = new Date(iso);
-  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mm}-${dd}`;
 }
 
 export function dayLabel(iso: string): string {
