@@ -17,7 +17,9 @@ cd frontend && npm run build   # tsc -b && vite build -> frontend/dist/
 cd frontend && npm run lint    # oxlint (the only linter in the repo)
 ```
 
-There is **no test framework and no tests** in this repo — don't hunt for a test runner. There is also **no `start` script at the repo root**: the engine doesn't run itself. It's exercised either by a consuming deploy repo (see `examples/deploy-template/`, whose own `npm start` runs `node dist/main.js`) or via `examples/standalone.ts`.
+There is **no test framework** — don't hunt for a test runner. `npm test` runs `tsc` then Node's built-in `node:test` over `test/*.test.mjs`, which import the *compiled* `build/` output; only the working-hours scheduler arithmetic (`nextCycleDelayMs`) has tests so far. Test files live outside `src/` so they're never compiled into the published `build/`.
+
+There is also **no `start` script at the repo root**: the engine doesn't run itself. It's exercised either by a consuming deploy repo (see `examples/deploy-template/`, whose own `npm start` runs `node dist/main.js`) or via `examples/standalone.ts`.
 
 ## Critical conventions
 
@@ -75,6 +77,7 @@ A cycle that fetches fine but yields **zero** items is stored as `last_fetch_sta
 - `TwitterClient` (`src/twitter-client.ts`) holds one authenticated x.com Puppeteer page (reads via undici HTTP + X GraphQL; writes/list-scraping via the browser UI). It has **no internal locking**, so every caller MUST go through `browserMutex` (`src/browser-mutex.ts`) — this is why scheduled and manual refreshes can't race.
 - `website-watch.ts` uses a **separate, unauthenticated** browser (fresh page per check, no mutex needed) so it never navigates the logged-in session to third-party domains.
 - The scheduler runs **one recursive `setTimeout` loop per source** (not `setInterval`, so slow scrapes can't pile up), staggers initial kickoff by `index * 5000ms`, and clamps every interval to `MAX_REFRESH_INTERVAL_MINUTES` (24h max staleness).
+- **Working hours** (`WorkingHoursConfig`, injected as `startTerminal({ workingHours })`): each source keeps its own `refreshIntervalMinutes` inside the configured local-time window and drops to `quietIntervalMinutes` outside it, so overnight cycles aren't spent on a feed nobody reads. The window **only ever slows a source down** — a source already slower than the quiet interval keeps its own cadence. The delay is recomputed by the pure `nextCycleDelayMs` at *every* reschedule (not fixed at startup) so loops cross the boundaries on their own, and it never throws: it runs inside a `.then()` with no rejection handler, so a throw there would be an unhandled rejection and kill the process. Two constraints on any policy: keep `quietIntervalMinutes` under `stalenessThresholdHours` (or quiet sources alert as stale) and under each Twitter list's `hoursWindow` (or tweets fall out of the scrape window between cycles and are lost). `timeZone` must be explicit — containers normally run UTC.
 - **Manual/on-open refreshes** are rate-limited to once per `MIN_MANUAL_REFRESH_MS` (15 min) per source via `getRefreshEligibility` → HTTP 429; the background scheduler bypasses this entirely. The frontend mirrors the 15-min constant (`MIN_REFRESH_MS` in `App.tsx`) only to pre-disable the button — the server is authoritative.
 
 ### Auth (`src/auth.ts`)

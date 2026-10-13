@@ -53,6 +53,35 @@ export interface ExtraSection {
   instruction: string;
 }
 
+/**
+ * An optional deployment-wide policy that slows sources down outside a
+ * configured local-time window — so a feed that refreshes every 30 minutes
+ * through the working day drops to an hourly-ish trickle overnight and at the
+ * weekend, when nobody is reading and the LLM calls are pure waste.
+ *
+ * The window only ever ADDS delay: a source is never scheduled faster than its
+ * own `refreshIntervalMinutes`. So a slow source (a pricing page polled every
+ * 3h) is not dragged up to the fast cadence by a window that opens at 09:00.
+ *
+ * Omitted entirely ⇒ the pre-existing fixed-interval behaviour, unchanged.
+ */
+export interface WorkingHoursConfig {
+  /** IANA timezone the window is evaluated in, e.g. "Europe/Vilnius". Required — containers usually run UTC. */
+  timeZone: string;
+  /** Local hour the window opens (0-23), inclusive. */
+  startHour: number;
+  /** Local hour the window closes (0-24), exclusive. 24 means "until midnight". */
+  endHour: number;
+  /** Days the window applies to, 1=Mon … 7=Sun. Defaults to Mon-Fri. */
+  days?: number[];
+  /**
+   * Interval used outside the window. A source already slower than this keeps
+   * its own interval — see the note above. Must be less than any Twitter list's
+   * `hoursWindow`, or tweets slide out of the scrape window between cycles.
+   */
+  quietIntervalMinutes: number;
+}
+
 // Every source lives in one sources.json, discriminated by `type` — the
 // "abstracted category" a source belongs to. Adding a new category (a fifth
 // type) means adding a variant here, a config-loading branch in

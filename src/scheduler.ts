@@ -18,7 +18,14 @@ import {
   type ResolvedFeedItem,
 } from "./db.js";
 import { evaluateStaleness, resolveStalenessThresholdHours } from "./staleness.js";
-import type { TwitterListSourceConfig, Source, Tweet, ExtraSection, ListFetchStatus } from "./types.js";
+import type {
+  TwitterListSourceConfig,
+  Source,
+  Tweet,
+  ExtraSection,
+  ListFetchStatus,
+  WorkingHoursConfig,
+} from "./types.js";
 import type { FeatureFlags } from "./terminal-config.js";
 
 export const schedulerEvents = new EventEmitter();
@@ -305,6 +312,164 @@ function reportStaleness(source: Source): void {
   );
 }
 
+// ─── Working-hours (day/night) cadence ──────────────────────────────────
+// See WorkingHoursConfig in types.ts. The window only ever slows a source
+// down, and the delay is recomputed at every reschedule rather than fixed at
+// start-up, so each loop crosses the window boundaries on its own.
+
+/** No delay below this is ever scheduled, so a malformed config can't spin the loop. */
+const MIN_DELAY_MS = 60 * 1000;
+
+// If the window opens within this of the delay we were about to schedule, treat
+// the source as already open. Otherwise a cycle landing at 08:59:59.9 gets
+// capped to ~0 and wakes again a minute later, burning a whole extra cycle.
+const OPENING_GRACE_MS = 5 * 60 * 1000;
+
+const DEFAULT_WORKING_DAYS = [1, 2, 3, 4, 5];
+
+const MAX_DELAY_MS = MAX_REFRESH_INTERVAL_MINUTES * 60 * 1000;
+
+/** Formatters are pure and reusable; building one per cycle would be wasteful. */
+const timeZoneFormatters = new Map<string, Intl.DateTimeFormat>();
+
+function formatterFor(timeZone: string): Intl.DateTimeFormat {
+  let formatter = timeZoneFormatters.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      // h23, not hour12:false — some ICU builds render midnight as "24".
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    timeZoneFormatters.set(timeZone, formatter);
+  }
+  return formatter;
+}
+
+interface LocalTime {
+  /** Minutes since local midnight. */
+  minutesOfDay: number;
+  /** 1=Mon … 7=Sun. */
+  weekday: number;
+}
+
+function localTime(timeZone: string, at: number): LocalTime {
+  const parts = formatterFor(timeZone).formatToParts(new Date(at));
+  const value = (type: string): number => Number(parts.find((part) => part.type === type)?.value);
+
+  const year = value("year");
+  const month = value("month");
+  const day = value("day");
+
+  return {
+    minutesOfDay: value("hour") * 60 + value("minute"),
+    // Derived from the date parts rather than the locale's weekday string, so
+    // the result doesn't depend on the locale's week-start convention.
+    weekday: new Date(Date.UTC(year, month - 1, day)).getUTCDay() || 7,
+  };
+}
+
+function workingDays(policy: WorkingHoursConfig): number[] {
+  return policy.days?.length ? policy.days : DEFAULT_WORKING_DAYS;
+}
+
+function isWithinWindow(policy: WorkingHoursConfig, now: number): boolean {
+  const { minutesOfDay, weekday } = localTime(policy.timeZone, now);
+  if (!workingDays(policy).includes(weekday)) return false;
+  return minutesOfDay >= policy.startHour * 60 && minutesOfDay < policy.endHour * 60;
+}
+
+/**
+ * Whole minutes from `now` until the window next opens, or null when the policy
+ * lists no day it could ever open on. Walks forward day by day (up to a week)
+ * so a Friday evening resolves to Monday rather than inventing weekend openings.
+ */
+function minutesUntilOpening(policy: WorkingHoursConfig, now: number): number | null {
+  const days = workingDays(policy);
+  const { minutesOfDay, weekday } = localTime(policy.timeZone, now);
+  const openingMinutes = policy.startHour * 60;
+
+  for (let offset = 0; offset <= 7; offset++) {
+    const day = ((weekday - 1 + offset) % 7) + 1;
+    if (!days.includes(day)) continue;
+    if (offset === 0) {
+      // Today only counts while the window hasn't opened yet.
+      if (minutesOfDay < openingMinutes) return openingMinutes - minutesOfDay;
+      continue;
+    }
+    return offset * 24 * 60 + openingMinutes - minutesOfDay;
+  }
+  return null;
+}
+
+/** Never returns a value outside [MIN_DELAY_MS, MAX_DELAY_MS], whatever goes in. */
+function clampDelay(ms: number): number {
+  if (!Number.isFinite(ms) || ms <= 0) return MAX_DELAY_MS;
+  return Math.min(Math.max(ms, MIN_DELAY_MS), MAX_DELAY_MS);
+}
+
+function clampIntervalMinutes(minutes: number): number {
+  if (!Number.isFinite(minutes) || minutes <= 0) return MAX_REFRESH_INTERVAL_MINUTES;
+  return Math.min(minutes, MAX_REFRESH_INTERVAL_MINUTES);
+}
+
+/**
+ * How long to wait before this source's next cycle.
+ *
+ * Pure and total: it never throws and never returns a value that would spin the
+ * loop. `scheduleNext` calls this inside a `.then()` with no rejection handler,
+ * so a throw here would be an unhandled rejection and take the whole process
+ * down on Node ≥15.
+ *
+ * `staggerMs` is this source's start-up offset (see startScheduler). It is added
+ * to the window-opening cap so sources don't all pile onto 09:00:00 together,
+ * which would undo the stagger exactly when the day's first refresh lands.
+ */
+export function nextCycleDelayMs(
+  activeMinutes: number,
+  policy: WorkingHoursConfig | null,
+  now: number,
+  staggerMs = 0
+): number {
+  let activeMs = MAX_DELAY_MS;
+  try {
+    activeMs = clampIntervalMinutes(activeMinutes) * 60 * 1000;
+
+    if (!policy) return clampDelay(activeMs);
+    if (isWithinWindow(policy, now)) return clampDelay(activeMs);
+
+    // Outside the window. Never faster than the source's own interval: a source
+    // already slower than the quiet interval keeps its own cadence.
+    const quietMs = Math.max(activeMs, clampIntervalMinutes(policy.quietIntervalMinutes) * 60 * 1000);
+
+    const untilOpening = minutesUntilOpening(policy, now);
+    if (untilOpening === null) return clampDelay(quietMs);
+
+    // Whole-minute arithmetic can't see the seconds we're already into the
+    // current minute; subtracting them lands on the boundary, not up to 59s early.
+    const msIntoMinute = ((now % 60_000) + 60_000) % 60_000;
+    const msUntilOpening = untilOpening * 60_000 - msIntoMinute + staggerMs;
+
+    // Close enough that waking early would just burn a cycle: treat as open.
+    if (msUntilOpening <= OPENING_GRACE_MS) return clampDelay(activeMs);
+
+    return clampDelay(Math.min(quietMs, msUntilOpening));
+  } catch {
+    // A malformed policy must not take the scheduler loop down with it. Fall
+    // back to the plain interval — never the floor, which would spin.
+    return clampDelay(activeMs);
+  }
+}
+
+export interface SchedulerOptions {
+  /** Optional deployment-wide day/night cadence. Omitted ⇒ fixed intervals, as before. */
+  workingHours?: WorkingHoursConfig;
+}
+
 /**
  * Starts one independent recursive-timeout loop per source. Uses setTimeout
  * (not setInterval) so the next run is only scheduled once the current one
@@ -312,13 +477,19 @@ function reportStaleness(source: Source): void {
  * let cycles pile up in the browser mutex queue. Source-agnostic: works the
  * same for Twitter lists, HuggingNews, or any future source type, since all
  * that's needed is `refreshIntervalMinutes` and `runCycle()`.
+ *
+ * With `workingHours` set the delay is recomputed after every cycle rather than
+ * fixed at start-up, so each loop crosses the window boundaries on its own
+ * without a restart. The initial kick-off still runs immediately whatever the
+ * hour — a deliberate catch-up after downtime.
  */
-export function startScheduler(sources: Source[]): void {
+export function startScheduler(sources: Source[], options: SchedulerOptions = {}): void {
+  const policy = options.workingHours ?? null;
+
   sources.forEach((source, index) => {
-    // Clamp to the max-staleness guarantee: even a source configured with a
-    // huge (or missing) interval still refreshes at least once every 24h.
-    const effectiveMinutes = Math.min(source.refreshIntervalMinutes, MAX_REFRESH_INTERVAL_MINUTES);
-    const intervalMs = effectiveMinutes * 60 * 1000;
+    // Also this source's offset when the day's first cycle lands on the window
+    // opening — see nextCycleDelayMs.
+    const staggerMs = index * 5000;
 
     // Both cycle runners catch their own errors, but a throw escaping one
     // would otherwise kill this source's loop for the life of the process —
@@ -332,10 +503,11 @@ export function startScheduler(sources: Source[]): void {
     };
 
     const scheduleNext = () => {
-      setTimeout(() => runCycle(scheduleNext), intervalMs);
+      const delayMs = nextCycleDelayMs(source.refreshIntervalMinutes, policy, Date.now(), staggerMs);
+      setTimeout(() => runCycle(scheduleNext), delayMs);
     };
 
     // Stagger initial kick-off so sources don't all hit the browser mutex at once.
-    setTimeout(() => runCycle(scheduleNext), index * 5000);
+    setTimeout(() => runCycle(scheduleNext), staggerMs);
   });
 }

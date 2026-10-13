@@ -1,4 +1,4 @@
-import type { SourceConfig, ExtraSection } from "./types.js";
+import type { SourceConfig, ExtraSection, WorkingHoursConfig } from "./types.js";
 
 // ─── Public configuration surface for startTerminal() ───────────────────
 // Everything the engine needs is passed IN here by the consumer. The core
@@ -74,6 +74,14 @@ export interface StartTerminalOptions {
    * default entirely, leaving only per-source opt-ins.
    */
   stalenessThresholdHours?: number;
+  /**
+   * Optional day/night cadence: sources refresh on their configured interval
+   * inside the window and on `quietIntervalMinutes` outside it. Omitted ⇒ every
+   * source keeps its fixed interval around the clock, as before.
+   *
+   * The window only ever slows a source down — see WorkingHoursConfig.
+   */
+  workingHours?: WorkingHoursConfig;
   features: FeatureFlags;
   branding: Branding;
   extensions?: TerminalExtensions;
