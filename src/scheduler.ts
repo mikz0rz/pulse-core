@@ -15,7 +15,9 @@ import {
   upsertDigest,
   upsertSection,
   getCheckpoint,
+  getDigestState,
   type ResolvedFeedItem,
+  type DigestState,
 } from "./db.js";
 import { evaluateStaleness, resolveStalenessThresholdHours } from "./staleness.js";
 import type {
@@ -114,25 +116,146 @@ export function configureScheduler(flags: FeatureFlags): void {
 }
 
 /**
- * Regenerates a list's rolling digest from its trailing 24h of stories.
- * Shared by the Twitter-list pipeline (runListCycle below) and any other
- * source (e.g. huggingnews.ts) that persists items into the same feed_items
- * table under its own list id. Only called when a cycle actually produced
- * new items, mirroring the "skip the LLM call when nothing changed" cost
- * control used for the main feed-item generation. Failures here are logged,
- * not thrown — the feed items themselves are already safely persisted by the
- * time this runs, so a digest hiccup shouldn't turn a successful cycle into
- * a reported error.
+ * How long a digest may go without a full rebuild. Incremental updates can only
+ * fold new stories in — the model cannot tell that a bullet's story has aged out
+ * of the 24h window — so drift accumulates until the next rebuild. 12h bounds a
+ * bullet's age at roughly 24h + 12h + one cycle.
+ */
+export const DIGEST_FULL_REBUILD_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * At or above this share of the window being new, an incremental update saves
+ * little and drifts more than a rebuild, so rebuild instead. This is what fires
+ * on the first cycle after a quiet stretch — e.g. the working-hours window
+ * opening, when the batch is most of the window.
+ */
+const DIGEST_MOSTLY_NEW_RATIO = 0.5;
+
+export type DigestPlan<T> =
+  | { mode: "skip"; reason: "empty-window" | "no-new-items" }
+  | {
+      mode: "full";
+      reason: "disabled" | "no-previous" | "bad-timestamp" | "rebuild-due" | "mostly-new" | "fallback";
+      items: T[];
+      itemCount: number;
+    }
+  | { mode: "incremental"; reason: "incremental"; items: T[]; previousBullets: string[]; itemCount: number };
+
+/**
+ * Decides how (or whether) to regenerate a list's digest this cycle. Pure and
+ * total — it never throws, because it runs on the scheduler's reschedule path
+ * where an escaped error would be far worse than an over-eager rebuild. Every
+ * path that cannot trust its inputs falls back to a full rebuild: spending more
+ * is always better than serving a digest built on a bad cursor.
+ *
+ * `itemCount` is always the size of the 24h WINDOW, never the incremental batch
+ * — the frontend renders it to the user as "past 24 hours · N stories".
+ */
+export function planDigest<T extends { createdAt: string }>(input: {
+  /** Items in the trailing 24h window, filtered by post time (item_timestamp). */
+  windowItems: T[];
+  previous: DigestState | null;
+  now: number;
+  incrementalEnabled: boolean;
+  fullRebuildIntervalMs?: number;
+}): DigestPlan<T> {
+  const { windowItems, previous, now, incrementalEnabled } = input;
+  const interval = input.fullRebuildIntervalMs ?? DIGEST_FULL_REBUILD_MS;
+  const itemCount = Array.isArray(windowItems) ? windowItems.length : 0;
+
+  const full = (reason: Extract<DigestPlan<T>, { mode: "full" }>["reason"]): DigestPlan<T> => ({
+    mode: "full",
+    reason,
+    items: windowItems,
+    itemCount,
+  });
+  const skip = (reason: "empty-window" | "no-new-items"): DigestPlan<T> => ({ mode: "skip", reason });
+
+  try {
+    if (itemCount === 0) return skip("empty-window");
+    if (!incrementalEnabled) return full("disabled");
+    if (!previous || previous.bullets.length === 0) return full("no-previous");
+
+    const generatedAt = Date.parse(previous.generatedAt);
+    const fullRebuildAt = previous.fullRebuildAt === null ? NaN : Date.parse(previous.fullRebuildAt);
+    if (!Number.isFinite(now) || !Number.isFinite(generatedAt) || !Number.isFinite(fullRebuildAt)) {
+      return full("bad-timestamp");
+    }
+    // A clock that moved backwards makes the cursor meaningless.
+    if (generatedAt > now || fullRebuildAt > now) return full("bad-timestamp");
+    if (windowItems.some((item) => !Number.isFinite(Date.parse(item.createdAt)))) return full("bad-timestamp");
+
+    // Checked BEFORE the "nothing new" skip below: a rebuild exists to drop
+    // bullets whose stories have aged out of the window, and that is worth doing
+    // even when the cycle that triggered it added nothing new.
+    if (now - fullRebuildAt >= interval) return full("rebuild-due");
+
+    // Split by INSERT time (createdAt), not item_timestamp. A tweet posted hours
+    // ago but scraped for the first time now is still new to the digest; posting
+    // time would drop it from the batch and the digest would never see it. Ties
+    // count as new — showing the model a story twice is harmless, missing one
+    // is not.
+    const items = windowItems.filter((item) => Date.parse(item.createdAt) >= generatedAt);
+    if (items.length === 0) return skip("no-new-items");
+    if (items.length >= itemCount * DIGEST_MOSTLY_NEW_RATIO) return full("mostly-new");
+
+    return { mode: "incremental", reason: "incremental", items, previousBullets: previous.bullets, itemCount };
+  } catch {
+    return itemCount > 0 ? full("fallback") : skip("empty-window");
+  }
+}
+
+/**
+ * Regenerates a list's rolling digest from its trailing 24h of stories. Shared
+ * by the Twitter-list pipeline (runListCycle below) and any other source (e.g.
+ * huggingnews.ts) that persists items into the same feed_items table under its
+ * own list id. Only called when a cycle actually produced new items, mirroring
+ * the "skip the LLM call when nothing changed" cost control used for the main
+ * feed-item generation.
+ *
+ * When the digest is already fresh, only the stories inserted since it was
+ * written are sent, together with the existing bullets — see planDigest. A full
+ * rebuild happens every DIGEST_FULL_REBUILD_MS regardless.
+ *
+ * Failures here are logged, not thrown — the feed items themselves are already
+ * safely persisted by the time this runs, so a digest hiccup shouldn't turn a
+ * successful cycle into a reported error.
  */
 export async function refreshDigest(listId: string, description: string): Promise<void> {
   if (!features.aiDigest) return;
   try {
-    const sinceIso = new Date(Date.now() - DIGEST_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
-    const recentItems = getRecentFeedItemsByTimestamp(listId, sinceIso);
-    if (recentItems.length === 0) return;
+    // Snapshot BEFORE the read, with no await in between. This timestamp is the
+    // cursor the next incremental update runs from, so anything inserted after
+    // it — e.g. by a manual refresh overlapping this one — is picked up next
+    // time instead of being skipped forever.
+    const now = Date.now();
+    const snapshotIso = new Date(now).toISOString();
+    const sinceIso = new Date(now - DIGEST_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
 
-    const bullets = await generateDigest(recentItems, { description });
-    if (bullets.length > 0) upsertDigest(listId, bullets, recentItems.length);
+    const plan = planDigest({
+      windowItems: getRecentFeedItemsByTimestamp(listId, sinceIso),
+      previous: getDigestState(listId) ?? null,
+      now,
+      incrementalEnabled: features.incrementalDigest !== false,
+    });
+    if (plan.mode === "skip") return;
+
+    const bullets =
+      plan.mode === "full"
+        ? await generateDigest(plan.items, { description })
+        : await generateDigest(plan.items, { description }, { previousBullets: plan.previousBullets });
+
+    // Nothing usable came back: leave the cursor alone so the next cycle retries
+    // with these same items rather than skipping them.
+    if (bullets.length === 0) return;
+
+    upsertDigest(listId, bullets, plan.itemCount, {
+      generatedAt: snapshotIso,
+      fullRebuild: plan.mode === "full",
+    });
+    console.log(
+      `[scheduler] Digest ${listId}: ${plan.mode} (${plan.reason}), sent ${plan.items.length} of ${plan.itemCount} item(s).`
+    );
   } catch (error) {
     console.warn(`[scheduler] Digest generation failed for ${listId}:`, error);
   }

@@ -28,6 +28,19 @@ export interface FeatureFlags {
   extraSections: boolean;
   /** Generate the rolling TL;DR digest per source. */
   aiDigest: boolean;
+  /**
+   * Update the digest from only the stories inserted since it was last written,
+   * instead of re-sending the whole trailing 24h every cycle. Cuts that prompt
+   * roughly 10x on a busy source; a full rebuild every `DIGEST_FULL_REBUILD_MS`
+   * (12h) bounds the drift this accumulates.
+   *
+   * Defaults to ON — except when `extensions.prompts.buildDigestPrompt` is
+   * overridden, where it defaults to OFF. An override written against the old
+   * argument list has no way to fold in `previousBullets`, so incremental mode
+   * would silently produce a digest of just the newest stories. Set it
+   * explicitly once your override handles both modes.
+   */
+  incrementalDigest?: boolean;
 }
 
 export interface Branding {
@@ -43,7 +56,22 @@ export interface Branding {
 
 export interface PromptOverrides {
   buildFeedItemsPrompt?(args: { dumpText: string; promptContext?: string; existingCategories: string[] }): string;
-  buildDigestPrompt?(args: { description: string; bulletDump: string }): string;
+  /**
+   * Two modes, distinguished by `previousBullets`:
+   *
+   * - **Full** (`previousBullets` undefined): `bulletDump` holds every story in
+   *   the trailing 24h. Derive the bullets from scratch.
+   * - **Incremental** (`previousBullets` non-empty): `previousBullets` is the
+   *   currently stored TL;DR and `bulletDump` holds ONLY the stories inserted
+   *   since it was written. The prompt must ask for the COMPLETE updated list,
+   *   not a delta — models otherwise return just the changes and the older
+   *   bullets are lost.
+   *
+   * An override that ignores `previousBullets` will produce a digest of only the
+   * new stories, so `features.incrementalDigest` defaults to OFF whenever this
+   * hook is overridden. Set it to true once your override handles both modes.
+   */
+  buildDigestPrompt?(args: { description: string; bulletDump: string; previousBullets?: string[] }): string;
   buildSectionsPrompt?(args: { description: string; bulletDump: string; sections: ExtraSection[] }): string;
   buildWebsiteDiffPrompt?(args: { description: string; url: string; diffText: string; existingCategories: string[] }): string;
 }

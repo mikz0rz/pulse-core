@@ -121,7 +121,15 @@ export function startTerminal(options: StartTerminalOptions): void {
   });
   configureHuggingNews(options.huggingNewsApiKey);
   configureStaleness(options.stalenessThresholdHours);
-  configureScheduler(options.features);
+  configureScheduler({
+    ...options.features,
+    // Resolved here rather than at the call site so no consumer has to know the
+    // rule. An overridden buildDigestPrompt was written against the old
+    // argument list and cannot fold in `previousBullets`, so incremental mode
+    // would silently reduce the digest to the newest stories; default it off
+    // there. An explicit value in `features` always wins.
+    incrementalDigest: options.features.incrementalDigest ?? !options.extensions?.prompts?.buildDigestPrompt,
+  });
 
   const twitter = new TwitterClient(options.twitter.authToken, options.twitter.ct0);
   const sources: Source[] = buildSources(twitter, options.sources, options.features);

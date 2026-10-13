@@ -79,11 +79,19 @@ the public repo:
 import type { TerminalExtensions } from "pulse-core";
 export const myExtensions: TerminalExtensions = {
   prompts: {
-    buildDigestPrompt: ({ description, bulletDump }) => `...your tuned wording...`,
+    buildDigestPrompt: ({ description, bulletDump, previousBullets }) => `...your tuned wording...`,
     // buildFeedItemsPrompt, buildSectionsPrompt, buildWebsiteDiffPrompt also overridable
   },
 };
 ```
+
+`buildDigestPrompt` is called in two modes, distinguished by `previousBullets`:
+undefined means a full rebuild (`bulletDump` = the whole trailing 24h), a
+non-empty array means an incremental update (those are the stored bullets and
+`bulletDump` holds only the newly inserted stories — ask for the **complete**
+updated list, not a delta). Since an override copied from an older version can't
+handle the second mode, overriding this hook switches `features.incrementalDigest`
+off by default; set it to `true` once your wording handles both.
 
 ```ts
 // apps/extended/main.ts

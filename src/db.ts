@@ -66,7 +66,12 @@ export function initDb(dbPath: string): void {
       list_id TEXT PRIMARY KEY,
       summary TEXT NOT NULL,
       generated_at TEXT NOT NULL,
-      item_count INTEGER NOT NULL
+      item_count INTEGER NOT NULL,
+      -- When this list's digest was last rebuilt from the full window, as opposed
+      -- to updated incrementally. NULL means "never" — see scheduler.ts's
+      -- planDigest. Deliberately NOT generated_at: a busy list rewrites its
+      -- digest every cycle, so generated_at can never tell you a rebuild is due.
+      full_rebuild_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS website_snapshots (
@@ -121,6 +126,16 @@ export function initDb(dbPath: string): void {
         last_fetch_started_at
       )
     `);
+  }
+
+  // Incremental digests (see scheduler.ts) need to know when a list was last
+  // rebuilt from the full window. Every digest written before this column
+  // existed WAS a full rebuild, so backfilling from generated_at is accurate
+  // and saves each list one rebuild. planDigest still treats NULL as "rebuild".
+  const digestColumns = db.prepare("PRAGMA table_info(list_digests)").all() as Array<{ name: string }>;
+  if (!digestColumns.some((c) => c.name === "full_rebuild_at")) {
+    db.exec("ALTER TABLE list_digests ADD COLUMN full_rebuild_at TEXT");
+    db.exec("UPDATE list_digests SET full_rebuild_at = generated_at");
   }
 
   normalizeCategoryCasingDuplicates();
@@ -189,12 +204,19 @@ export function initDb(dbPath: string): void {
       watching_since = COALESCE(watching_since, excluded.watching_since)
   `);
   upsertDigestStmt = db.prepare(`
-    INSERT INTO list_digests (list_id, summary, generated_at, item_count)
-    VALUES (@list_id, @summary, @generated_at, @item_count)
+    INSERT INTO list_digests (list_id, summary, generated_at, item_count, full_rebuild_at)
+    VALUES (@list_id, @summary, @generated_at, @item_count, @full_rebuild_at)
     ON CONFLICT(list_id) DO UPDATE SET
       summary = excluded.summary,
       generated_at = excluded.generated_at,
-      item_count = excluded.item_count
+      item_count = excluded.item_count,
+      -- Incremental writes pass NULL and must not clear the marker of the last
+      -- full rebuild, or the 12h rebuild would be deferred forever.
+      full_rebuild_at = COALESCE(excluded.full_rebuild_at, list_digests.full_rebuild_at)
+    -- A manual refresh and a scheduler tick can overlap, and generated_at is the
+    -- snapshot taken before the LLM call. Drop a write whose snapshot predates
+    -- what is already stored, so a slow cycle cannot clobber a newer digest.
+    WHERE excluded.generated_at >= list_digests.generated_at
   `);
   upsertWebsiteSnapshotStmt = db.prepare(`
     INSERT INTO website_snapshots (website_id, content_hash, content, updated_at)
@@ -419,12 +441,29 @@ export function markFetchDone(listId: string, status: ListFetchStatus, opts: Fet
   });
 }
 
-export function upsertDigest(listId: string, bullets: string[], itemCount: number): void {
+/**
+ * @param options.generatedAt Snapshot time taken BEFORE the LLM call, not the
+ *   write time. It is the cursor the next incremental update runs from, so using
+ *   the write time would silently skip anything inserted while the call was in
+ *   flight. Defaults to now.
+ * @param options.fullRebuild Whether this write rebuilt from the whole window.
+ *   Defaults to true, which is what every write meant before incremental
+ *   updates existed. An incremental write passes false and leaves the
+ *   full-rebuild marker alone.
+ */
+export function upsertDigest(
+  listId: string,
+  bullets: string[],
+  itemCount: number,
+  options: { generatedAt?: string; fullRebuild?: boolean } = {}
+): void {
+  const generatedAt = options.generatedAt ?? new Date().toISOString();
   upsertDigestStmt.run({
     list_id: listId,
     summary: JSON.stringify(bullets),
-    generated_at: new Date().toISOString(),
+    generated_at: generatedAt,
     item_count: itemCount,
+    full_rebuild_at: (options.fullRebuild ?? true) ? generatedAt : null,
   });
 }
 
@@ -455,22 +494,52 @@ export function getWebsiteSnapshot(websiteId: string): WebsiteSnapshot | undefin
   };
 }
 
-export function getDigest(listId: string): ListDigest | undefined {
-  const row: any = db.prepare("SELECT * FROM list_digests WHERE list_id = ?").get(listId);
-  if (!row) return undefined;
+/**
+ * The stored digest plus the cursor incremental updates run from. Internal to
+ * the scheduler — deliberately NOT part of ListDigest, which is public API and
+ * goes straight onto the wire (see terminal.ts's /api/digest route).
+ */
+export interface DigestState {
+  bullets: string[];
+  /** Snapshot time of the last write, full or incremental. The incremental cursor. */
+  generatedAt: string;
+  /** Snapshot time of the last FULL rebuild, or null if there has never been one. */
+  fullRebuildAt: string | null;
+}
 
-  let bullets: string[];
+function readDigestRow(listId: string): any | undefined {
+  return db.prepare("SELECT * FROM list_digests WHERE list_id = ?").get(listId);
+}
+
+/** Bullets were always stored as JSON, but tolerate a legacy/plain-text row. */
+function parseBullets(summary: string): string[] {
   try {
-    bullets = JSON.parse(row.summary);
+    return JSON.parse(summary);
   } catch {
-    bullets = row.summary ? [row.summary] : [];
+    return summary ? [summary] : [];
   }
+}
+
+export function getDigest(listId: string): ListDigest | undefined {
+  const row = readDigestRow(listId);
+  if (!row) return undefined;
 
   return {
     listId: row.list_id,
-    bullets,
+    bullets: parseBullets(row.summary),
     generatedAt: row.generated_at,
     itemCount: row.item_count,
+  };
+}
+
+export function getDigestState(listId: string): DigestState | undefined {
+  const row = readDigestRow(listId);
+  if (!row) return undefined;
+
+  return {
+    bullets: parseBullets(row.summary),
+    generatedAt: row.generated_at,
+    fullRebuildAt: row.full_rebuild_at ?? null,
   };
 }
 

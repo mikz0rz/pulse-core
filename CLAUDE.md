@@ -17,7 +17,7 @@ cd frontend && npm run build   # tsc -b && vite build -> frontend/dist/
 cd frontend && npm run lint    # oxlint (the only linter in the repo)
 ```
 
-There is **no test framework** — don't hunt for a test runner. `npm test` runs `tsc` then Node's built-in `node:test` over `test/*.test.mjs`, which import the *compiled* `build/` output; only the working-hours scheduler arithmetic (`nextCycleDelayMs`) has tests so far. Test files live outside `src/` so they're never compiled into the published `build/`.
+There is **no test framework** — don't hunt for a test runner. `npm test` runs `tsc` then Node's built-in `node:test` over `test/*.test.mjs`, which import the *compiled* `build/` output. Test files live outside `src/` so they're never compiled into the published `build/`. Coverage is deliberately narrow: the pure decision functions that are hard to get right and easy to test without a database or a network — `nextCycleDelayMs` and `planDigest` (`test/scheduler.test.mjs`) and `isRetryableLlmError` (`test/summarizer.test.mjs`). **Follow that precedent**: when a change adds subtle arithmetic or a subtle predicate, extract it into a pure, total, exported function and unit-test it there rather than adding an integration harness.
 
 There is also **no `start` script at the repo root**: the engine doesn't run itself. It's exercised either by a consuming deploy repo (see `examples/deploy-template/`, whose own `npm start` runs `node dist/main.js`) or via `examples/standalone.ts`.
 
@@ -54,7 +54,7 @@ A `Source` also carries a resolved `stalenessThresholdHours` (see **Staleness** 
 
 ### Data flow (all source types converge)
 
-Every source persists into the **one `feed_items` table** under its own `list_id`, so the same UI renders all types with no per-type code. Dedup differs by source: Twitter dedupes against the `raw_tweets` table; all other sources dedupe via an `external_id` UNIQUE index (`hasExternalFeedItem`). Optional per-source syntheses — the rolling TL;DR `digest` and the opt-in `extraSections` — are **regenerated in place each cycle** (upserted, never accumulated) from the trailing 24h of items, and only when a cycle produced new items.
+Every source persists into the **one `feed_items` table** under its own `list_id`, so the same UI renders all types with no per-type code. Dedup differs by source: Twitter dedupes against the `raw_tweets` table; all other sources dedupe via an `external_id` UNIQUE index (`hasExternalFeedItem`). Optional per-source syntheses — the rolling TL;DR `digest` and the opt-in `extraSections` — are **regenerated in place each cycle** (upserted, never accumulated), and only when a cycle produced new items. Both are derived from the trailing 24h of items, but the digest sends only the newly inserted stories on most cycles (see *The rolling digest* below); `extraSections` still sends the full 24h every time.
 
 ### Staleness / silent-failure detection (`src/staleness.ts`)
 
@@ -69,8 +69,23 @@ A cycle that fetches fine but yields **zero** items is stored as `last_fetch_sta
 
 - Two providers: `openai` (OpenAI-compatible, incl. custom `baseUrl` gateways) and `gemini` (default). Gemini uses `responseSchema` for structured JSON; OpenAI uses `response_format: json_object`.
 - **URL-hallucination guard**: the model is given tweets tagged with local ref keys (`T1`, `T2`, …) and must cite `sourceRefs`, never URLs. The server (`runListCycle`) resolves refs → real `x.com` links. `sourceRefs` is `.min(1)` in the Zod schema so an item can never land with zero source links.
-- **Resilience**: one transport-level retry, then a JSON-repair retry (re-prompt with the bad output) before throwing; malformed items in an otherwise-valid batch are dropped, not fatal.
+- **Resilience**: one transport-level retry, then a JSON-repair retry (re-prompt with the bad output) before throwing; malformed items in an otherwise-valid batch are dropped, not fatal. The transport retry is **narrow on purpose** — `isRetryableLlmError` (pure, exported, tested) retries only 408, 5xx except 501, `TimeoutError`, and undici's `TypeError("fetch failed")`. 4xx including **429** is not retried: the retry was immediate, so it burned quota again at the exact moment quota was the problem, and the next scheduled cycle is the natural backoff. Failures are thrown as `LlmHttpError`, whose `"<Provider> API error: <status>"` message prefix is load-bearing — `sanitizeErrorForClient` in `scheduler.ts` matches it to keep LLM response bodies out of the UI. The two call sites that lose data on failure (`runListCycle` inserts raw tweets before summarizing; `checkDiffSite` advances the snapshot before diffing) keep the transport retry on their JSON-repair call; digest and sections self-heal next cycle and so use a plain `callProvider` there.
 - **Prompt overrides** are the primary extension point: `extensions.prompts.build*Prompt` lets a private deploy inject tuned wording without it living in this repo. Anything not overridden falls back to the `default*Prompt` builders here.
+
+### The rolling digest (`refreshDigest` in `src/scheduler.ts`)
+
+The largest single prompt in the system, so it has its own cost control. `planDigest` (pure, exported, tested — same precedent as `nextCycleDelayMs`) picks one of three modes per cycle, first matching rule winning: empty window → skip; incremental off → full; no previous digest → full; untrustworthy timestamps → full (spend more, stay correct); rebuild overdue → full, checked **before** the no-new-items skip, since a rebuild exists to drop aged-out bullets and is worth doing even when the triggering cycle added nothing; nothing new → skip; new items ≥ 50% of the window → full; otherwise → incremental. It never throws — it runs on the reschedule path, where an escaped error is far worse than an over-eager rebuild.
+
+Four traps the implementation exists to avoid:
+
+- **The cursor is a pre-read snapshot.** `refreshDigest` takes `Date.now()` *before* the DB read with no `await` in between. Stamping it after the LLM call would skip anything inserted during that call — potentially 90s+ — permanently.
+- **The split is on insert time (`createdAt`), not post time (`itemTimestamp`).** A tweet posted 6h ago but first scraped now is genuinely new to the digest; splitting on post time would drop it and the digest would never see it. Ties count as new — seeing a story twice is harmless, missing one is not.
+- **Drift needs its own marker.** Incremental rewrites accumulate error because the model can't tell that a bullet's story has aged out of the window. Bounding it needs the last *full* rebuild time, which cannot be `generated_at`: on a busy source the digest is rewritten every cycle, so "rebuild when the stored digest is older than 12h" would never fire. Hence the separate nullable `list_digests.full_rebuild_at`, advanced only on a full rebuild and carried across incremental writes by `COALESCE` in the upsert. That upsert also carries `WHERE excluded.generated_at >= list_digests.generated_at`, because the background loop never checks the checkpoint and a manual refresh can overlap a timer tick — a stale snapshot must not overwrite a newer one (ISO strings compare correctly).
+- **`itemCount` is always the 24h window size**, never the incremental batch — `TldrSection.tsx` renders it as the user-visible `past 24 hours · N stories`.
+
+`DigestState` (bullets + cursor + rebuild marker) is deliberately **not** part of the public `ListDigest`, which goes straight onto the wire; the scheduler reads the marker through the separate `getDigestState`. That keeps `full_rebuild_at` off the API and out of the hand-mirrored `frontend/src/api.ts`. `generatedAt` on the wire is the snapshot time, which can precede the actual write by the length of the LLM call; nothing renders it.
+
+Bullets can therefore describe a story up to ~36h old (24h window + 12h rebuild + one cycle) under a "past 24 hours" label. `DIGEST_FULL_REBUILD_MS` is the knob that bounds that.
 
 ### Browsers & concurrency
 
@@ -86,7 +101,9 @@ Single-user password login → HMAC-signed, self-verifying session cookie (**no 
 
 ### Feature flags
 
-`features: { websiteDiff, extraSections, aiDigest }` gate optional capabilities per deployment. Notably `websiteDiff: false` makes `buildSources` silently drop `website_diff` sources, so variants can ship one shared source list with capabilities toggled off.
+`features: { websiteDiff, extraSections, aiDigest, incrementalDigest? }` gate optional capabilities per deployment. Notably `websiteDiff: false` makes `buildSources` silently drop `website_diff` sources, so variants can ship one shared source list with capabilities toggled off.
+
+`incrementalDigest` is optional and **resolved in `terminal.ts`, not at the call site**, so no consumer has to know the rule: `options.features.incrementalDigest ?? !options.extensions?.prompts?.buildDigestPrompt`. An overridden `buildDigestPrompt` was written against the old single-mode argument list and can't fold in `previousBullets`, so incremental mode would silently reduce the digest to only the newest stories — defaulting it off there makes that impossible, and doubles as a kill switch. An explicit value always wins.
 
 ### Frontend (`frontend/`)
 

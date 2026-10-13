@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { setTimeout as delay } from "node:timers/promises";
 import type { Tweet, TwitterListSourceConfig, FeedItemDraft, FeedItem, ExtraSection } from "./types.js";
 import type { LlmConfig, PromptOverrides } from "./terminal-config.js";
 
@@ -107,6 +108,15 @@ export function buildTweetDump(tweets: Tweet[]): { dumpText: string; refMap: Map
   return { dumpText: lines.join("\n\n---\n\n"), refMap };
 }
 
+/**
+ * Renders already-summarized feed items as the `- [Brand] headline: summary`
+ * lines the digest and section syntheses both consume. These are headlines, not
+ * raw tweets — no ref keys, because neither synthesis cites sources.
+ */
+function buildBulletDump(items: FeedItem[]): string {
+  return items.map((item) => `- ${item.brand ? `[${item.brand}] ` : ""}${item.headline}: ${item.summary}`).join("\n");
+}
+
 function buildCategoryInstruction(existingCategories: string[]): string {
   return existingCategories.length > 0
     ? `Categories already used for this list: ${existingCategories.join(", ")}. Reuse one of these exactly (same spelling/casing) if it fits. Only invent a new category if none of these fit, and if you do, keep it short, Title Case, and avoid creating a near-duplicate of an existing one (e.g. don't invent "Product Updates" if "Product Update" is already in the list above).`
@@ -141,14 +151,33 @@ Tweets:
 ${args.dumpText}`;
 }
 
-function defaultDigestPrompt(args: { description: string; bulletDump: string }): string {
-  return `Here are the most recent headlines from "${args.description}" over roughly the past day:
+function defaultDigestPrompt(args: { description: string; bulletDump: string; previousBullets?: string[] }): string {
+  const previous = args.previousBullets ?? [];
+
+  if (previous.length === 0) {
+    return `Here are the most recent headlines from "${args.description}" over roughly the past day:
 
 ${args.bulletDump}
 
 Identify the 3-6 MOST IMPORTANT, distinct developments or themes across these headlines. Merge related items that share a theme into a single bullet. Each bullet must be ONE short, information-dense sentence (not a paragraph), naming the specific brand/product involved.
 
 Reply with ONLY a JSON object of the form { "bullets": ["...", "...", ...] }, no prose, no markdown fences.`;
+  }
+
+  return `You maintain a short TL;DR of the most important developments from "${args.description}" over roughly the past day.
+
+Current TL;DR:
+${previous.map((bullet) => `- ${bullet}`).join("\n")}
+
+New headlines since it was written:
+
+${args.bulletDump}
+
+Update the TL;DR so it still covers the 3-6 MOST IMPORTANT, distinct developments overall. Fold a new headline into an existing bullet when it is the same story or theme, replace a weaker bullet when a new development matters more, and leave a bullet untouched when nothing new affects it. Do not add a bullet merely because a headline is new, and do not let the list grow past six.
+
+Each bullet must be ONE short, information-dense sentence (not a paragraph), naming the specific brand/product involved.
+
+Reply with ONLY a JSON object of the form { "bullets": ["...", "...", ...] } containing the COMPLETE updated list, not just the changes. No prose, no markdown fences.`;
 }
 
 function defaultSectionsPrompt(args: { description: string; bulletDump: string; sections: ExtraSection[] }): string {
@@ -178,6 +207,47 @@ Reply with ONLY a JSON object of the form { "headline": "...", "summary": "...",
 // A batch's LLM call is one big synchronous round trip with no partial
 // progress — if the connection stalls, fail fast instead of hanging.
 const LLM_TIMEOUT_MS = 90_000;
+
+/** Pause before a transport-level retry, so a momentary 5xx has a chance to clear. */
+const LLM_RETRY_DELAY_MS = 2_000;
+
+/**
+ * An LLM request that reached the provider and came back non-2xx. The message
+ * prefix is load-bearing: `sanitizeErrorForClient` in scheduler.ts regex-matches
+ * `"<Provider> API error:"` so that the raw provider body stays in the server
+ * log and never reaches the UI.
+ */
+export class LlmHttpError extends Error {
+  constructor(
+    readonly provider: "OpenAI" | "Gemini",
+    readonly status: number,
+    body: string
+  ) {
+    super(`${provider} API error: ${status} ${body}`);
+    this.name = "LlmHttpError";
+  }
+}
+
+/**
+ * Whether an LLM failure is worth an immediate second attempt — deliberately
+ * narrow, because a retry only helps when the failure might not repeat.
+ *
+ * - 4xx is deterministic (bad key, unknown model id, malformed request), and
+ *   **429 is not retried either**: a rate limit or exhausted quota will not
+ *   clear on an instant second attempt, so retrying it only doubles the spend
+ *   during exactly the outage where budget matters. The next scheduled cycle is
+ *   the real backoff.
+ * - 501 is "not implemented" — as permanent as any 4xx.
+ * - A JSON parse failure on a 2xx is not retried here: that response is already
+ *   paid for, and the caller's repair pass is what handles it.
+ * - Anything unrecognised fails closed.
+ */
+export function isRetryableLlmError(error: unknown): boolean {
+  if (error instanceof LlmHttpError) return error.status === 408 || (error.status >= 500 && error.status !== 501);
+  if (error instanceof Error && error.name === "TimeoutError") return true; // AbortSignal.timeout
+  if (error instanceof TypeError && error.message === "fetch failed") return true; // undici network failure
+  return false;
+}
 
 async function callOpenAI(prompt: string, geminiSchema: object | null): Promise<string> {
   const baseUrl = llmConfig.baseUrl || "https://api.openai.com/v1";
@@ -209,7 +279,7 @@ async function callOpenAI(prompt: string, geminiSchema: object | null): Promise<
   });
 
   if (!response.ok) {
-    throw new Error(`OpenAI API error: ${response.status} ${await response.text()}`);
+    throw new LlmHttpError("OpenAI", response.status, await response.text());
   }
   const data = (await response.json()) as any;
   return data.choices?.[0]?.message?.content || "{}";
@@ -234,7 +304,7 @@ async function callGemini(prompt: string, geminiSchema: object | null): Promise<
   );
 
   if (!response.ok) {
-    throw new Error(`Gemini API error: ${response.status} ${await response.text()}`);
+    throw new LlmHttpError("Gemini", response.status, await response.text());
   }
   const data = (await response.json()) as any;
   return data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
@@ -244,12 +314,18 @@ async function callProvider(prompt: string, geminiSchema: object | null): Promis
   return llmConfig.provider === "openai" ? callOpenAI(prompt, geminiSchema) : callGemini(prompt, geminiSchema);
 }
 
-/** One retry on transport-level failure (timeout, connection reset) — distinct from the JSON-repair retry below. */
+/**
+ * One retry on a transient failure (5xx, timeout, connection reset) — distinct
+ * from the JSON-repair retry below, and never applied to a deterministic error.
+ * See isRetryableLlmError.
+ */
 async function callProviderWithRetry(prompt: string, geminiSchema: object | null): Promise<string> {
   try {
     return await callProvider(prompt, geminiSchema);
   } catch (error) {
+    if (!isRetryableLlmError(error)) throw error;
     console.warn(`[summarizer] LLM call failed (${(error as Error).message}), retrying once...`);
+    await delay(LLM_RETRY_DELAY_MS);
     return callProvider(prompt, geminiSchema);
   }
 }
@@ -331,23 +407,32 @@ function tryParseDigest(raw: string): string[] | null {
 /**
  * Synthesizes a handful of short, scannable highlight bullets across a
  * source's recent feed items (already-summarized headlines, not raw tweets).
+ *
+ * Two modes, selected by `previousBullets`: absent means `items` is the whole
+ * trailing 24h window and the bullets are derived from scratch; present means
+ * `items` holds only what was inserted since that digest was written, and the
+ * model is asked to fold them into the existing bullets.
  */
-export async function generateDigest(items: FeedItem[], source: { description: string }): Promise<string[]> {
+export async function generateDigest(
+  items: FeedItem[],
+  source: { description: string },
+  options: { previousBullets?: string[] } = {}
+): Promise<string[]> {
   if (items.length === 0) return [];
 
-  const bulletDump = items
-    .map((item) => `- ${item.brand ? `[${item.brand}] ` : ""}${item.headline}: ${item.summary}`)
-    .join("\n");
-
+  const bulletDump = buildBulletDump(items);
   const build = promptOverrides.buildDigestPrompt ?? defaultDigestPrompt;
-  const prompt = build({ description: source.description, bulletDump });
+  const prompt = build({ description: source.description, bulletDump, previousBullets: options.previousBullets });
 
   let raw = await callProviderWithRetry(prompt, GEMINI_DIGEST_SCHEMA);
   let bullets = tryParseDigest(raw);
 
   if (!bullets) {
+    // Repair with a plain call, not a transport-retried one: a digest that fails
+    // here self-heals on the next cycle (the cursor does not advance), so it is
+    // not worth a second transport retry on top of the repair.
     const repairPrompt = `Your previous response was not valid JSON. Reply with ONLY a JSON object of the form { "bullets": ["...", ...] }, no prose, no markdown fences.\n\nYour previous response was:\n${raw}`;
-    raw = await callProviderWithRetry(repairPrompt, GEMINI_DIGEST_SCHEMA);
+    raw = await callProvider(repairPrompt, GEMINI_DIGEST_SCHEMA);
     bullets = tryParseDigest(raw);
   }
 
@@ -385,9 +470,7 @@ export async function generateSections(
 ): Promise<GeneratedSection[]> {
   if (items.length === 0 || sections.length === 0) return [];
 
-  const bulletDump = items
-    .map((item) => `- ${item.brand ? `[${item.brand}] ` : ""}${item.headline}: ${item.summary}`)
-    .join("\n");
+  const bulletDump = buildBulletDump(items);
 
   const build = promptOverrides.buildSectionsPrompt ?? defaultSectionsPrompt;
   const prompt = build({ description: source.description, bulletDump, sections });
@@ -396,8 +479,9 @@ export async function generateSections(
   let parsed = tryParseSections(raw);
 
   if (!parsed) {
+    // Plain call, as in generateDigest — sections are regenerated next cycle.
     const repairPrompt = `Your previous response was not valid JSON. Reply with ONLY a JSON object of the form { "sections": [{ "title": "...", "content": "..." }, ...] }, no prose, no markdown fences.\n\nYour previous response was:\n${raw}`;
-    raw = await callProviderWithRetry(repairPrompt, GEMINI_SECTIONS_SCHEMA);
+    raw = await callProvider(repairPrompt, GEMINI_SECTIONS_SCHEMA);
     parsed = tryParseSections(raw);
   }
 

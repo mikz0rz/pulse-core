@@ -78,11 +78,19 @@ The engine never reads secrets from `process.env` — the caller injects them vi
 
 ```ts
 type FeatureFlags = {
-  websiteDiff: boolean;   // allow website_diff sources to run
-  extraSections: boolean; // run the per-source strategic-synthesis sections
-  aiDigest: boolean;      // generate the rolling TL;DR digest
+  websiteDiff: boolean;       // allow website_diff sources to run
+  extraSections: boolean;     // run the per-source strategic-synthesis sections
+  aiDigest: boolean;          // generate the rolling TL;DR digest
+  incrementalDigest?: boolean; // update the digest from new stories only (default: on)
 };
 ```
+
+`incrementalDigest` is the main per-call cost lever. On, each refresh sends the
+model its previous bullets plus only the stories inserted since, and asks for the
+complete updated list — instead of re-sending the whole trailing 24h to
+re-derive an answer that barely changed. A full rebuild runs every 12 hours
+regardless, which bounds how far the digest can drift from the window. Turn it
+off to rebuild in full every cycle.
 
 ## Extension points
 
@@ -93,7 +101,7 @@ startTerminal({
   /* ... */
   extensions: {
     prompts: {
-      buildDigestPrompt: ({ description, bulletDump }) => `...your tuned prompt...`,
+      buildDigestPrompt: ({ description, bulletDump, previousBullets }) => `...your tuned prompt...`,
       // buildFeedItemsPrompt, buildSectionsPrompt, buildWebsiteDiffPrompt also overridable
     },
   },
@@ -101,6 +109,16 @@ startTerminal({
 ```
 
 Anything you don't override falls back to the built-in default.
+
+`buildDigestPrompt` is called in two modes. When `previousBullets` is undefined
+it's a full rebuild: `bulletDump` holds every story in the trailing 24h. When
+`previousBullets` is a non-empty array it's an incremental update: those are the
+bullets currently stored and `bulletDump` holds *only* the newly inserted
+stories — your prompt must ask for the complete updated list, not a delta, or the
+older bullets are lost. Because an override written against the old single-mode
+argument list can't do that, `incrementalDigest` **defaults to off whenever you
+override `buildDigestPrompt`**; set it to `true` once your prompt handles both
+modes.
 
 ## MCP server
 
