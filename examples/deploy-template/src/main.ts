@@ -37,6 +37,24 @@ startTerminal({
   // source with `stalenessThresholdHours` in sources.json (0 to silence one).
   // stalenessThresholdHours: 12,
 
+  // Optional: refresh fast through the working day and slowly outside it, so
+  // overnight cycles (and their LLM calls) aren't spent on a feed nobody is
+  // reading. Each source keeps its own `refreshIntervalMinutes` inside the
+  // window and drops to `quietIntervalMinutes` outside it — the window only
+  // ever SLOWS a source down, never speeds one up, so a page you poll every 3h
+  // stays at 3h. `timeZone` is required and must be an IANA zone: containers
+  // usually run UTC, so leaving it implicit would put the window in the wrong
+  // hours. Keep `quietIntervalMinutes` under both `stalenessThresholdHours`
+  // and any Twitter list's `hoursWindow`, or you'll get stale-source alerts
+  // and miss tweets that fall out of the scrape window between cycles.
+  // workingHours: {
+  //   timeZone: "Europe/Vilnius",
+  //   startHour: 9,
+  //   endHour: 18,          // exclusive
+  //   days: [1, 2, 3, 4, 5], // 1=Mon … 7=Sun; defaults to Mon-Fri
+  //   quietIntervalMinutes: 240,
+  // },
+
   // Turn capabilities on/off for this deployment.
   features: {
     websiteDiff: true,

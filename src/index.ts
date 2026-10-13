@@ -23,6 +23,7 @@ export type {
   RssFeedSourceConfig,
   WebsiteDiffSourceConfig,
   ExtraSection,
+  WorkingHoursConfig,
   FeedItem,
   ListDigest,
   ListSection,

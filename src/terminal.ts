@@ -15,9 +15,9 @@ import {
 import { loginHandler, logoutHandler, sessionStatusHandler, requireAuth, requireCsrfToken, configureAuth } from "./auth.js";
 import { configureSummarizer } from "./summarizer.js";
 import { configureHuggingNews } from "./huggingnews.js";
-import { configureStaleness } from "./staleness.js";
+import { configureStaleness, resolveStalenessThresholdHours } from "./staleness.js";
 import { closeWebsiteBrowser } from "./website-watch.js";
-import type { Source } from "./types.js";
+import type { Source, SourceConfig, WorkingHoursConfig } from "./types.js";
 import type { StartTerminalOptions } from "./terminal-config.js";
 
 // The built frontend ships inside this package (frontend/dist), resolved
@@ -41,6 +41,67 @@ function validateSecrets(appPassword: string, sessionSecret: string, secureCooki
 }
 
 /**
+ * Rejects a malformed working-hours policy at boot rather than letting it reach
+ * the scheduler. `nextCycleDelayMs` is written to survive bad input, but a bad
+ * timezone would otherwise silently schedule every source against the host's
+ * clock — a failure that looks like "the window just doesn't work".
+ */
+function validateWorkingHours(policy: WorkingHoursConfig | undefined): void {
+  if (!policy) return;
+
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: policy.timeZone });
+  } catch {
+    throw new Error(`workingHours.timeZone "${policy.timeZone}" is not a valid IANA timezone`);
+  }
+
+  const { startHour, endHour, days, quietIntervalMinutes } = policy;
+  if (!Number.isInteger(startHour) || !Number.isInteger(endHour) || startHour < 0 || endHour > 24 || startHour >= endHour) {
+    throw new Error(`workingHours must satisfy 0 <= startHour < endHour <= 24 (got ${startHour}..${endHour})`);
+  }
+  if (days !== undefined && (days.length === 0 || new Set(days).size !== days.length || days.some((d) => !Number.isInteger(d) || d < 1 || d > 7))) {
+    throw new Error("workingHours.days must be a non-empty list of unique integers 1-7 (1=Mon)");
+  }
+  if (!Number.isFinite(quietIntervalMinutes) || quietIntervalMinutes <= 0 || quietIntervalMinutes > 1440) {
+    throw new Error(`workingHours.quietIntervalMinutes must be between 1 and 1440 (got ${quietIntervalMinutes})`);
+  }
+}
+
+/**
+ * Flags quiet-hours settings that will produce confusing behaviour later rather
+ * than an outright error: a dry spell that outlasts the staleness threshold
+ * (noisy "source is broken" alerts), or a quiet interval wider than a list's
+ * scrape window (tweets that slide out of the window between cycles and are
+ * then lost for good, since dedupe is by tweet id).
+ */
+function warnOnWorkingHours(policy: WorkingHoursConfig | undefined, configs: SourceConfig[]): void {
+  if (!policy) return;
+  const quietHours = policy.quietIntervalMinutes / 60;
+
+  for (const config of configs) {
+    if (!config.enabled) continue;
+
+    if (config.type === "twitter_list") {
+      const windowHours = config.hoursWindow ?? 24;
+      if (quietHours >= windowHours) {
+        console.warn(
+          `[terminal] ${config.id}: quietIntervalMinutes (${policy.quietIntervalMinutes}) is >= its hoursWindow (${windowHours}h) — ` +
+            `tweets posted between quiet cycles will fall out of the scrape window and be missed.`
+        );
+      }
+    }
+
+    const threshold = resolveStalenessThresholdHours(config);
+    if (threshold !== null && threshold < 2 * quietHours) {
+      console.warn(
+        `[terminal] ${config.id}: staleness threshold (${threshold}h) is under 2x the quiet interval (${quietHours}h) — ` +
+          `expect staleness alerts on quiet sources.`
+      );
+    }
+  }
+}
+
+/**
  * Boots the whole news-terminal engine: persistence, scheduler, and the
  * password-protected web feed. Every secret and toggle is passed in via
  * `options`; the core reads nothing from the environment itself.
@@ -48,6 +109,8 @@ function validateSecrets(appPassword: string, sessionSecret: string, secureCooki
 export function startTerminal(options: StartTerminalOptions): void {
   const secureCookie = options.secureCookie ?? true;
   validateSecrets(options.appPassword, options.sessionSecret, secureCookie);
+  validateWorkingHours(options.workingHours);
+  warnOnWorkingHours(options.workingHours, options.sources);
 
   initDb(options.dbPath);
   configureSummarizer(options.llm, options.extensions?.prompts);
@@ -213,7 +276,7 @@ export function startTerminal(options: StartTerminalOptions): void {
     console.log(`[terminal] "${options.branding.title}" listening on port ${options.port}`);
   });
 
-  startScheduler(sources);
+  startScheduler(sources, { workingHours: options.workingHours });
 
   const shutdown = async (signal: string) => {
     console.log(`[terminal] Received ${signal}, shutting down...`);

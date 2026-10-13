@@ -21,7 +21,8 @@
   "scripts": {
     "build": "tsc && npm --prefix frontend run build",
     "prepare": "npm --prefix frontend install && npm run build",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "tsc && node --test test/*.test.mjs"
   },
   "keywords": [
     "news",
