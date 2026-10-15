@@ -108,7 +108,7 @@ function staleSnack(stale: StaleSource, onShow: () => void): Snack {
   };
 }
 
-function Feed({ title }: { title: string }) {
+function Feed({ title, authEnabled }: { title: string; authEnabled: boolean }) {
   const [lists, setLists] = useState<ListSummary[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [items, setItems] = useState<FeedItem[]>([]);
@@ -296,9 +296,11 @@ function Feed({ title }: { title: string }) {
           <span className="brand-pulse" />
           <h1>{title}</h1>
         </div>
-        <button className="logout-btn" onClick={handleLogout}>
-          Log out
-        </button>
+        {authEnabled && (
+          <button className="logout-btn" onClick={handleLogout}>
+            Log out
+          </button>
+        )}
       </header>
 
       <SyncStatusBar lists={lists} stale={staleSources} />
@@ -412,11 +414,17 @@ function Feed({ title }: { title: string }) {
 function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
+  // Defaults true so a server that predates the field still renders the Log out
+  // button; only an explicit false hides it.
+  const [authEnabled, setAuthEnabled] = useState(true);
   const [title, setTitle] = useState("Pulse");
 
   useEffect(() => {
     getSession()
-      .then((s) => setAuthenticated(s.authenticated))
+      .then((s) => {
+        setAuthenticated(s.authenticated);
+        setAuthEnabled(s.authEnabled !== false);
+      })
       .finally(() => setAuthChecked(true));
   }, []);
 
@@ -432,7 +440,7 @@ function App() {
 
   if (!authChecked) return <div className="loading-screen">Loading…</div>;
   if (!authenticated) return <Login title={title} onSuccess={() => setAuthenticated(true)} />;
-  return <Feed title={title} />;
+  return <Feed title={title} authEnabled={authEnabled} />;
 }
 
 export default App;

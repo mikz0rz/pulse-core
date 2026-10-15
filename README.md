@@ -39,6 +39,7 @@ startTerminal({
   dbPath: "./data.db",
   appPassword: process.env.APP_PASSWORD!,       // you supply the secret
   sessionSecret: process.env.SESSION_SECRET!,    // you supply the secret
+  // authEnabled: false,                         // only behind a VPN / IP allowlist
   secureCookie: true,                            // behind TLS in production
   llm: { provider: "gemini", apiKey: process.env.GEMINI_API_KEY! },
   twitter: { authToken: process.env.TWITTER_AUTH_TOKEN!, ct0: process.env.TWITTER_CT0! },
@@ -48,7 +49,7 @@ startTerminal({
 });
 ```
 
-Then open the port, log in with your `appPassword`, and configured sources populate on their own schedules. See [`examples/standalone.ts`](./examples/standalone.ts) for a runnable single-file version.
+Then open the port, log in with your `appPassword`, and configured sources populate on their own schedules. (With `authEnabled: false` there is no login step — the feed opens directly.) See [`examples/standalone.ts`](./examples/standalone.ts) for a runnable single-file version.
 
 ## Running your own deployment
 
@@ -69,6 +70,7 @@ The engine never reads secrets from `process.env` — the caller injects them vi
 | `twitter.authToken` / `twitter.ct0` | cookies from a logged-in x.com session (for `twitter_list`) |
 | `llm.provider` / `llm.apiKey` / `llm.baseUrl` / `llm.modelId` | LLM for summaries (OpenAI-compatible or Gemini) |
 | `appPassword` / `sessionSecret` | single-user login for the web UI |
+| `authEnabled` | optional, defaults `true`. `false` serves the feed with no login — only correct behind a gate that is not this app (VPN, IP allowlist, authenticated proxy), never on a directly-reachable port |
 | `dbPath` | where the SQLite file lives |
 | `huggingNewsApiKey` | optional, for the `media_list` HuggingNews provider |
 

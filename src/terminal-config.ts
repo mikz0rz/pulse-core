@@ -83,8 +83,28 @@ export interface TerminalExtensions {
 export interface StartTerminalOptions {
   port: number;
   dbPath: string;
-  appPassword: string;
-  sessionSecret: string;
+  /**
+   * Required when `authEnabled` is true (the default), and validated at boot:
+   * under 8 characters is refused. Unused when auth is disabled.
+   */
+  appPassword?: string;
+  /** Required when `authEnabled` is true (the default); minimum 32 characters. */
+  sessionSecret?: string;
+  /**
+   * Serve the feed without a login. Defaults to true.
+   *
+   * Only set this to false behind a gate that is not this app — a VPN, an IP
+   * allowlist, an authenticated proxy — and never on a port that is directly
+   * reachable from the internet. Nothing else in the engine can tell the
+   * difference, so disabling auth here is a statement about the network the
+   * process sits on, not about the process itself.
+   *
+   * With it off: `/api/session` reports authenticated, the login screen never
+   * renders, `/api/login` 404s, and `appPassword` / `sessionSecret` are not
+   * required. CSRF protection stays on — the cookie is issued by the read
+   * routes instead of at login.
+   */
+  authEnabled?: boolean;
   /**
    * Set the session cookie's Secure flag. Defaults to true; deployments without
    * TLS must explicitly set this to false (not recommended for production).

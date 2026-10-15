@@ -25,7 +25,19 @@ import type { StartTerminalOptions } from "./terminal-config.js";
 // pulse-core is installed as a dependency in another repo.
 const FRONTEND_DIST = fileURLToPath(new URL("../frontend/dist", import.meta.url));
 
-function validateSecrets(appPassword: string, sessionSecret: string, secureCookie: boolean): void {
+/**
+ * Boot-time check on the login secrets. Both are only meaningful when auth is
+ * on: with it off no session cookie is ever issued and no password is ever
+ * compared, so requiring them would be friction with nothing behind it. The
+ * checks themselves are unchanged for the auth-on path.
+ */
+function validateSecrets(
+  appPassword: string,
+  sessionSecret: string,
+  secureCookie: boolean,
+  authEnabled: boolean
+): void {
+  if (!authEnabled) return;
   if (appPassword.length < 8) {
     throw new Error("appPassword must be at least 8 characters long");
   }
@@ -108,15 +120,31 @@ function warnOnWorkingHours(policy: WorkingHoursConfig | undefined, configs: Sou
  */
 export function startTerminal(options: StartTerminalOptions): void {
   const secureCookie = options.secureCookie ?? true;
-  validateSecrets(options.appPassword, options.sessionSecret, secureCookie);
+  // `!== false`, not `?? true`: only a literal false disables the login gate.
+  // A JS caller passing 0, "" or null is not asking for an open feed, and the
+  // difference between "explicitly off" and "falsy" is the whole security
+  // question here.
+  const authEnabled = options.authEnabled !== false;
+  validateSecrets(options.appPassword ?? "", options.sessionSecret ?? "", secureCookie, authEnabled);
   validateWorkingHours(options.workingHours);
   warnOnWorkingHours(options.workingHours, options.sources);
+
+  if (authEnabled) {
+    console.log("[terminal] auth enabled — the feed requires the app password.");
+  } else {
+    console.warn(
+      "[terminal] auth DISABLED — the feed is served unauthenticated. Only safe behind a " +
+        "network gate (VPN, IP allowlist, authenticated proxy); anything that can reach this " +
+        "port can read the feed. /api/login is closed and appPassword/sessionSecret are ignored."
+    );
+  }
 
   initDb(options.dbPath);
   configureSummarizer(options.llm, options.extensions?.prompts);
   configureAuth({
-    appPassword: options.appPassword,
-    sessionSecret: options.sessionSecret,
+    enabled: authEnabled,
+    appPassword: options.appPassword ?? "",
+    sessionSecret: options.sessionSecret ?? "",
     secureCookie,
   });
   configureHuggingNews(options.huggingNewsApiKey);

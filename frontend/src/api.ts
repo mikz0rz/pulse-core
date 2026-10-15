@@ -62,12 +62,25 @@ function getCsrfToken(): string | undefined {
     ?.split("=")[1];
 }
 
+/**
+ * CSRF is a double submit: the server compares the pulse_csrf cookie against
+ * the X-CSRF-Token header, so every mutating request needs both. Shared rather
+ * than inlined in api() because refreshList below talks to the same guarded
+ * route through a raw fetch — and forgetting the header there is a silent 403,
+ * not a compile error.
+ */
+function csrfHeaders(method: string): Record<string, string> {
+  const upper = method.toUpperCase();
+  if (upper === "GET" || upper === "HEAD" || upper === "OPTIONS") return {};
+  const token = getCsrfToken();
+  return token ? { "X-CSRF-Token": token } : {};
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const method = init?.method?.toUpperCase() ?? "GET";
-  const csrfToken = method !== "GET" && method !== "HEAD" && method !== "OPTIONS" ? getCsrfToken() : undefined;
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
-  if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
+  for (const [k, v] of Object.entries(csrfHeaders(method))) headers.set(k, v);
 
   const res = await fetch(path, { ...init, headers });
   if (!res.ok) {
@@ -83,7 +96,8 @@ export interface Branding {
 }
 
 export const getConfig = () => api<{ branding: Branding }>("/api/config");
-export const getSession = () => api<{ authenticated: boolean }>("/api/session");
+export const getSession = () =>
+  api<{ authenticated: boolean; authEnabled?: boolean }>("/api/session");
 export const login = (password: string) =>
   api<{ ok: boolean }>("/api/login", { method: "POST", body: JSON.stringify({ password }) });
 export const logout = () => api<{ ok: boolean }>("/api/logout", { method: "POST" });
@@ -100,7 +114,7 @@ export interface RefreshResult {
 export async function refreshList(listId: string): Promise<RefreshResult> {
   const res = await fetch(`/api/lists/${encodeURIComponent(listId)}/refresh`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...csrfHeaders("POST") },
   });
   if (res.status === 429) {
     const body = await res.json().catch(() => ({}));

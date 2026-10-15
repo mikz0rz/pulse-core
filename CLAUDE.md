@@ -99,6 +99,13 @@ Bullets can therefore describe a story up to ~36h old (24h window + 12h rebuild 
 
 Single-user password login → HMAC-signed, self-verifying session cookie (**no server-side session store**), timing-safe comparison, in-memory per-IP login rate limit. `app.set("trust proxy", 1)` in `terminal.ts` is required for correct `req.ip` behind a reverse proxy (else the rate limiter collapses to one bucket).
 
+**Auth is optional** (`StartTerminalOptions.authEnabled`, default true). Setting it to `false` serves the feed unauthenticated — correct only behind a gate that is not this app (VPN, IP allowlist, authenticated proxy), never on a directly-reachable port; the engine cannot see the network, so the flag is a claim about it. With it off: `/api/session` reports `authenticated: true` (which is what suppresses the login screen — the UI gates entirely on that one field), `/api/login` 404s, and `appPassword`/`sessionSecret` are neither required nor validated at boot.
+
+Two things to preserve when touching this:
+
+- **`enabled` is read as `=== false`, never falsily.** `configureAuth` replaces the config singleton wholesale, so a caller omitting the field leaves it `undefined` — and `!undefined` is true, which would turn auth OFF on the deployment that most needs the gate. The singleton defaults `enabled: true`, `startTerminal` uses `options.authEnabled !== false` (not `?? true`, so a JS caller passing `0` cannot disable it), and `test/auth.test.mjs` guards the regression.
+- **CSRF stays on in both modes.** `requireCsrfToken` is untouched; instead the disabled branch of `requireAuth` issues the `pulse_csrf` cookie, which normally comes from login. `requireAuth` fronts every read route and the client loads `/api/lists` before it can POST, so the cookie is always in place in time. Do not "simplify" this by making `requireCsrfToken` a no-op — that would drop the protection on the public deployment too.
+
 ### Feature flags
 
 `features: { websiteDiff, extraSections, aiDigest, incrementalDigest? }` gate optional capabilities per deployment. Notably `websiteDiff: false` makes `buildSources` silently drop `website_diff` sources, so variants can ship one shared source list with capabilities toggled off.

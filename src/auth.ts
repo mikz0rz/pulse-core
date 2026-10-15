@@ -6,9 +6,20 @@ const CSRF_COOKIE_NAME = "pulse_csrf";
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 // Injected once by startTerminal — the core never reads these from the env.
-let authConfig = { appPassword: "", sessionSecret: "", secureCookie: false };
+//
+// `enabled` defaults to true and is replaced wholesale by configureAuth, so a
+// caller that omits it would leave it undefined — which is why every check
+// below tests `=== false` rather than falsiness. Falsiness would read a missing
+// field as "auth off", i.e. fail OPEN on exactly the deployment that most needs
+// the gate. Only a literal false disables auth.
+let authConfig = { enabled: true, appPassword: "", sessionSecret: "", secureCookie: false };
 
-export function configureAuth(config: { appPassword: string; sessionSecret: string; secureCookie: boolean }): void {
+export function configureAuth(config: {
+  enabled: boolean;
+  appPassword: string;
+  sessionSecret: string;
+  secureCookie: boolean;
+}): void {
   authConfig = config;
 }
 
@@ -110,6 +121,17 @@ function isRateLimited(key: string): boolean {
 }
 
 export function loginHandler(req: Request, res: Response): void {
+  // With auth off there is no password to check and no session to mint, so this
+  // route simply doesn't exist. Answering would also be a 500 waiting to happen:
+  // a correct password would reach buildSessionValue() → getSecret(), which
+  // throws when sessionSecret is empty — and a deployment that turned auth off
+  // has no reason to keep one set. Returning early also keeps the login
+  // rate-limit Map (entries are never evicted) from growing.
+  if (authConfig.enabled === false) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+
   // req.ip is the leftmost X-Forwarded-For entry when trust proxy is set; if
   // the proxy is not configured to strip untrusted values, fall back to the
   // raw TCP remote address so the rate limit bucket is not shared globally.
@@ -146,12 +168,38 @@ export function logoutHandler(_req: Request, res: Response): void {
 }
 
 export function sessionStatusHandler(req: Request, res: Response): void {
+  // The client gates the whole UI on this one field, so with auth off it must
+  // report authenticated — otherwise the login screen renders against a server
+  // that will never accept a password. authEnabled is returned in both modes so
+  // the client can hide login-only chrome (the Log out button) without having
+  // to infer it from a second request.
+  if (authConfig.enabled === false) {
+    res.json({ authenticated: true, authEnabled: false });
+    return;
+  }
   const cookies = parseCookies(req.headers.cookie);
-  res.json({ authenticated: isValidSessionValue(cookies[SESSION_COOKIE_NAME]) });
+  res.json({
+    authenticated: isValidSessionValue(cookies[SESSION_COOKIE_NAME]),
+    authEnabled: true,
+  });
 }
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const cookies = parseCookies(req.headers.cookie);
+
+  if (authConfig.enabled === false) {
+    // No login gate — but CSRF still guards the mutating routes, and its cookie
+    // is normally handed out at login, which never happens here. Issue it from
+    // this request instead. requireAuth fronts every read route, and the client
+    // loads /api/lists before it can POST anything, so the cookie is always in
+    // place before requireCsrfToken can ask for it.
+    if (!cookies[CSRF_COOKIE_NAME]) {
+      setCsrfCookie(res, generateCsrfToken(), authConfig.secureCookie);
+    }
+    next();
+    return;
+  }
+
   if (isValidSessionValue(cookies[SESSION_COOKIE_NAME])) {
     // Ensure existing sessions that predate the CSRF cookie get one.
     if (!cookies[CSRF_COOKIE_NAME]) {
